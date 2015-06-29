@@ -1,0 +1,26 @@
+; tiobench like setup, add more fX files between the stonewalls to
+; create more threads
+
+[global]
+ioengine=libaio
+direct=1
+size=512m
+bsrange=4k-4k
+timeout=30
+numjobs=1
+filename=/dev/loop0
+
+[f1]
+rw=write
+
+[f2]
+stonewall
+rw=randwrite
+
+[f3]
+stonewall
+rw=read
+
+[f4]
+stonewall
+rw=randread
