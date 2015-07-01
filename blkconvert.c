@@ -246,7 +246,7 @@ static void blkconvert(FILE *ifile, FILE *ofile)
 		struct blkio *io;
 		uint64_t start_time, end_time;
 
-		if (!((trace.action & 0xffff) != __BLK_TA_QUEUE) ||
+		if (((trace.action & 0xffff) != __BLK_TA_QUEUE) ||
 				!(trace.action & BLK_TC_ACT(BLK_TC_QUEUE)))
 			continue;
 
