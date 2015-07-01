@@ -3,6 +3,26 @@
 
 #include "common.h"
 
+#ifndef offsetof
+/**
+ * Get offset of a member
+ */
+#define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
+#endif
+
+#ifndef container_of
+/**
+ * Casts a member of a structure out to the containing structure
+ * @param ptr        the pointer to the member.
+ * @param type       the type of the container struct this is embedded in.
+ * @param member     the name of the member within the struct.
+ *
+ */
+#define container_of(ptr, type, member) ({                      \
+        const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
+	        (type *)( (char *)__mptr - offsetof(type,member) );})
+#endif
+
 struct list_head {
 	struct list_head *next, *prev;
 };
@@ -82,6 +102,8 @@ static inline void __list_del(struct list_head * prev, struct list_head * next)
 static inline void list_del(struct list_head *entry)
 {
 	__list_del(entry->prev, entry->next);
+	entry->next = 0;
+	entry->prev = 0;
 }
 
 /**
@@ -116,6 +138,18 @@ static inline void list_del(struct list_head *entry)
 #define list_entry(ptr, type, member) \
         container_of(ptr, type, member)
 
+static inline int list_len(struct list_head *head_p)
+{
+	struct list_head *p;
+	int n = 0;
+
+	__list_for_each(p, head_p) {
+		n++;
+	}
+
+	return n;
+}
+
 /**
  * list_empty - tests whether a list is empty
  * @head: the list to test.
@@ -134,16 +168,64 @@ static inline struct list_head *list_first(const struct list_head *head)
 	return list_empty(head) ? NULL : head->next;
 }
 
-static inline int list_len(struct list_head *head_p)
+/**
+ * list_move_tail - delete from one list and add as another's tail
+ * @list: the entry to move
+ * @head: the head that will follow our entry
+ */
+static inline void list_move_tail(struct list_head *list,
+				  struct list_head *head)
 {
-	struct list_head *p;
-	int n = 0;
+        __list_del(list->prev, list->next);
+        list_add_tail(list, head);
+}
 
-	__list_for_each(p, head_p) {
-		n++;
-	}
+static inline void __list_splice(struct list_head *list,
+                                 struct list_head *head)
+{
+        struct list_head *first = list->next;
+        struct list_head *last = list->prev;
+        struct list_head *at = head->next;
 
-	return n;
+        first->prev = head;
+        head->next = first;
+
+        last->next = at;
+        at->prev = last;
+}
+
+/**
+ *  * list_splice - join two lists
+ *   * @list: the new list to add.
+ *    * @head: the place to add it in the first list.
+ *     */
+static inline void list_splice(struct list_head *list, struct list_head *head)
+{
+        if (!list_empty(list))
+                __list_splice(list, head);
+}
+
+/**
+ * list_replace - replace old entry by new one
+ * @old : the element to be replaced
+ * @new : the new element to insert
+ *
+ * If @old was empty, it will be overwritten.
+ */
+static inline void list_replace(struct list_head *old,
+				struct list_head *new)
+{
+	new->next = old->next;
+	new->next->prev = new;
+	new->prev = old->prev;
+	new->prev->next = new;
+}
+
+static inline void list_replace_init(struct list_head *old,
+					struct list_head *new)
+{
+	list_replace(old, new);
+	INIT_LIST_HEAD(old);
 }
 
 #endif

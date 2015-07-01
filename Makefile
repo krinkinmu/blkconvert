@@ -1,30 +1,41 @@
-CC ?= gcc
+CC       ?= gcc
 BLKTRACE ?= ../blktrace
-BTREPLAY ?= ../blktrace/btreplay
-CFLAGS ?= -Wall -Werror -std=gnu99 -I$(BLKTRACE) -I$(BTREPLAY)
-LDFLAGS ?=
+BTT      := $(BLKTRACE)/btt
+CFLAGS   ?= -Wall -I$(BLKTRACE) -I$(BTT) \
+	-UCOUNT_IOS -UDEBUG -DNDEBUG \
+	-D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
+LDFLAGS  := -laio -lrt -lpthread
 
 CSRCS := rbtree.c blkioqueue.c blkconvert.c
 CDEPS := $(CSRCS:.c=.d)
 COBJS := $(CSRCS:.c=.o)
-CTGT := convert
+CTGT  := compress
 
 RSRCS := btrecord.c
 RDEPS := $(RSRCS:.c=.d)
 ROBJS := $(RSRCS:.c=.o)
-RTGT := record
+RTGT  := convert
+
+PSRCS := btreplay.c
+PDEPS := $(PSRCS:.c=.d)
+POBJS := $(PSRCS:.c=.o)
+PTGT  := play
 
 -include $(CDEPS)
 -include $(RDEPS)
+-include $(PDEPS)
 
 .PHONY: all
-all: $(CTGT) $(RTGT)
+all: $(CTGT) $(RTGT) $(PTGT)
+
+$(PTGT): $(POBJS)
+	$(CC) $(POBJS) $(LDFLAGS) -o $@
 
 $(RTGT): $(ROBJS)
-	$(CC) $(LDFLAGS) $(ROBJS) -o $@
+	$(CC) $(ROBJS) $(LDFLAGS) -o $@
 
 $(CTGT): $(COBJS)
-	$(CC) $(LDFLAGS) $(COBJS) -o $@
+	$(CC) $(COBJS) $(LDFLAGS) -o $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -MMD -c $< -o $@
@@ -33,3 +44,4 @@ $(CTGT): $(COBJS)
 clean:
 	rm -rf $(CDEPS) $(COBJS) $(CTGT)
 	rm -rf $(RDEPS) $(ROBJS) $(RTGT)
+	rm -rf $(PDEPS) $(POBJS) $(PTGT)
