@@ -1,0 +1,26 @@
+NULL BLOCK DEVICE PARAMETERS:
+
+    sudo modprobe null_blk queue_mode=2 gb=1 irqmod=2
+
+    queue_mode=2 - multi-queue device
+    gb=1         - reported device size is 1GB
+    irqmod=2     - specific completition time (by default 10ns, to setup
+                   completition time use completition_nsec=<ns>)
+
+
+RUN BLKTRACE:
+
+    sudo ../../ws/blktrace/blktrace -d /dev/nullb0 -o nullb0 -D traces
+
+    -d /dev/nullb0 - watch /dev/nullb0 device
+    -o nullb0      - store traces in files with name 'nullb0.blktrace.<cpu>'
+    -D traces      - put ouput files in 'traces' directory
+
+RUN BLKPARSE
+
+    ../../ws/blktrace/blkparse -O -i nullb0 -D traces -d nullb0.blktrace
+
+    -O                 - do not output text data
+    -i nullb0          - look up files with name 'nullb0.blktrace.<cpu>'
+    -D traces          - look up files in the 'traces' directory
+    -d nullb0.blktrace - merge input files and output in the 'nullb0.blktrace'
