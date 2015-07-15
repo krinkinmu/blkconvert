@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -Wall -Wextra -Werror
+CFLAGS ?= -Wall -Wextra -Werror -I../common
 
 SRC := blkrecord.c
 DEP := $(SRC:.c=.d)

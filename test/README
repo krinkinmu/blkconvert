@@ -10,7 +10,7 @@ NULL BLOCK DEVICE PARAMETERS:
 
 RUN BLKTRACE:
 
-    sudo ../../ws/blktrace/blktrace -d /dev/nullb0 -o nullb0 -D traces
+    sudo blktrace -d /dev/nullb0 -o nullb0 -D traces
 
     -d /dev/nullb0 - watch /dev/nullb0 device
     -o nullb0      - store traces in files with name 'nullb0.blktrace.<cpu>'
@@ -18,9 +18,16 @@ RUN BLKTRACE:
 
 RUN BLKPARSE
 
-    ../../ws/blktrace/blkparse -O -i nullb0 -D traces -d nullb0.blktrace
+    blkparse -O -i nullb0 -D traces -d nullb0.blktrace
 
     -O                 - do not output text data
     -i nullb0          - look up files with name 'nullb0.blktrace.<cpu>'
     -D traces          - look up files in the 'traces' directory
     -d nullb0.blktrace - merge input files and output in the 'nullb0.blktrace'
+
+RUN BTT
+
+    btt -i nullb0.blktrace.replayed
+
+    -i nullb0.blktrace.replayed - look at blktrace file
+                                  'nullb0.blktrace.replayed'

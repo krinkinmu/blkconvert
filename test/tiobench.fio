@@ -1,6 +1,6 @@
 [global]
 ioengine=libaio
-iodepth=8
+iodepth=16
 direct=1
 size=512m
 bsrange=4k-4k

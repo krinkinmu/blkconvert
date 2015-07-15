@@ -33,7 +33,7 @@ static void show_usage(const char *name)
 		"\t-f Use specified blktrace file. Default: stdin\n" \
 		"\t-o Ouput file. Default: stdout\n" \
 		"\t-i Maximum sampling time interval in ms. Default: 1000\n" \
-		"\t-b Maximum io batch size. Default: 1000\n" \
+		"\t-b Maximum io batch size. Default: 10000\n" \
 		"\t-t Output in text format, by default output is binary.\n";
 
 	ERR("Usage: %s %s", name, usage);		
@@ -334,9 +334,13 @@ static int account_events(int ofd, const struct blkio_event *events,
 	memset(&stats, 0, sizeof(stats));
 	stats.first_time = events[0].time;
 	stats.last_time = events[size - 1].time;
-	stats.min_sector = ~((__u64)0);
 	for (i = 0; i != size; ++i) {
 		if (queue_event(events + i)) {
+			if (rw_events == 1) {
+				stats.min_sector = events[i].sector;
+				stats.max_sector = events[i].sector;
+			}
+
 			stats.min_sector = MIN(stats.min_sector,
 						events[i].sector);
 			stats.max_sector = MAX(stats.max_sector,
