@@ -18,6 +18,7 @@ static const __u64 sector_size = 512;
 static const char *input_file_name;
 static const char *device_file_name;
 static unsigned number_of_events = 512;
+static int use_direct_io = 1;
 
 #define ERR(...)  fprintf(stderr, __VA_ARGS__)
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -29,9 +30,11 @@ static void show_usage(const char *name)
 		" -d <device>           | --device=<device>\n" \
 		"[-f <input file>       | --file=<input file>]\n" \
 		"[-e <number of events> | --events=<number of events>]\n" \
+		"[-b                    | --buffered]\n" \
 		"\t-d Block device file. No default, must be specified.\n" \
 		"\t-f Use specified blkrecord file. Default: stdin\n" \
-		"\t-e Number of concurrently processing events. Default: 512\n";
+		"\t-e Max number of concurrently processing events. Default: 512\n" \
+		"\t-b Use buffered IO (do not use direct IO)\n";
 
 	ERR("Usage: %s %s", name, usage);
 }
@@ -58,10 +61,16 @@ static int parse_args(int argc, char **argv)
 			.val = 'e'
 		},
 		{
+			.name = "buffered",
+			.has_arg = required_argument,
+			.flag = NULL,
+			.val = 'b'
+		},
+		{
 			.name = NULL
 		}
 	};
-	static const char *opts = "f:d:e:";
+	static const char *opts = "f:d:e:b";
 
 	int c, i;
 
@@ -80,6 +89,9 @@ static int parse_args(int argc, char **argv)
 				return 1;
 			}
 			number_of_events = (unsigned)i;
+			break;
+		case 'b':
+			use_direct_io = 0;
 			break;
 		default:
 			show_usage(argv[0]);
@@ -322,6 +334,7 @@ static void play(int ifd, int dfd)
 int main(int argc, char **argv)
 {
 	int ifd = 0, dfd = 1;
+	int flags = O_RDWR;
 
 	if (parse_args(argc, argv))
 		return 1;
@@ -334,7 +347,9 @@ int main(int argc, char **argv)
 		}
 	}
 
-	dfd = open(device_file_name, O_RDWR | O_DIRECT);
+	if (use_direct_io)
+		flags |= O_DIRECT;
+	dfd = open(device_file_name, flags);
 	if (dfd < 0) {
 		close(ifd);
 		perror("Cannot open block device file");
