@@ -1,12 +1,14 @@
 NULL BLOCK DEVICE PARAMETERS:
 
-    sudo modprobe null_blk queue_mode=2 gb=1 irqmod=2
+    sudo modprobe null_blk queue_mode=2 gb=1 irqmode=2
 
-    queue_mode=2 - multi-queue device
+    queue_mode=2 - multi-queue mode
     gb=1         - reported device size is 1GB
-    irqmod=2     - specific completition time (by default 10ns, to setup
-                   completition time use completition_nsec=<ns>)
+    irqmod=2     - specific completition time (by default 10ns)
 
+    sudo modprobe null_blk queue_mode=1 gb=1 irqmode=2
+
+    queue_mode=1         - single-queue mode
 
 RUN BLKTRACE:
 
