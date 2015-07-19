@@ -146,7 +146,7 @@ static __u64 random_u64(__u64 from, __u64 to)
 
 	for (gen = 0; gen < 64; gen += bits)
 		value |= (unsigned)rand() << gen;
-	return value % (to - from) + from;
+	return value % (to - from + 1) + from;
 }
 
 static struct iocb *iocb_get(int fd, __u64 off, __u32 len, int rw)
@@ -190,13 +190,16 @@ static void iocbs_release(struct iocb **iocbs, size_t count)
 static int iocbs_fill(struct iocb **iocbs, int fd,
 			const struct blkio_stats *stat)
 {
-	const __u32 bytes = stat->bytes;
 	const __u64 min_sec = stat->min_sector;
-	const __u64 max_sec = stat->max_sector + 1;
+	const __u64 max_sec = stat->max_sector;
 
+	__u32 bytes = stat->bytes;
 	size_t reads = stat->reads, writes = stat->writes;
 	const size_t ios = reads + writes;
 	size_t i;
+
+	if (use_direct_io)
+		bytes = (bytes + sector_size - 1) & ~(sector_size - 1);
 
 	for (i = 0; i != ios; ++i) {
 		const __u64 off = sector_size * random_u64(min_sec, max_sec);
@@ -236,9 +239,17 @@ static int check_events(const struct io_event *events, size_t count)
 
 	for (i = 0; i != count; ++i) {
 		const struct io_event * const e = events + i;
+		const struct iocb * const iocb = e->obj;
 
-		if (e->res != e->obj->u.c.nbytes) {
-			ERR("AIO failed %ld/%ld\n", e->res, e->res2);
+		if (e->res != iocb->u.c.nbytes) {
+			const char *op = iocb->aio_lio_opcode == IO_CMD_PREAD ?
+				"read" : "write";
+			ERR("AIO %s of %ld bytes at %lld failed (%ld/%ld)\n",
+						op,
+						iocb->u.c.nbytes,
+						iocb->u.c.offset,
+						e->res,
+						e->res2);
 			return 1;
 		}
 	}
@@ -277,8 +288,8 @@ static int play_sample(io_context_t ctx, int fd,
 	reclaim_i = 0;
 	submit_i = 0;
 	while (reclaim_i != ios) {
-		size_t todo = MIN(ios - submit_i, iodepth);
-		size_t running;
+		const size_t running = submit_i - reclaim_i;
+		const size_t todo = MIN(ios - submit_i, iodepth - running);
 		int ret;
 
 		if (iocbs_submit(ctx, iocbs + submit_i, todo)) {
@@ -287,8 +298,7 @@ static int play_sample(io_context_t ctx, int fd,
 		}
 
 		submit_i += todo;
-		running = submit_i - reclaim_i;
-		ret = io_getevents(ctx, 1, running, events, NULL);
+		ret = io_getevents(ctx, 1, submit_i - reclaim_i, events, NULL);
 		if (ret < 0) {
 			ERR("Error %d, while reclaiming IO\n", -ret);
 			rc = 1;
