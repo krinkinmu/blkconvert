@@ -1,6 +1,7 @@
 [global]
 ioengine=libaio
-size=512m
+iodepth=16
+size=1g
 bs=512
 numjobs=1
 filename=/dev/nullb0
@@ -9,10 +10,4 @@ norandommap
 rw=write
 [f2]
 stonewall
-rw=randwrite
-[f3]
-stonewall
 rw=read
-[f4]
-stonewall
-rw=randread
