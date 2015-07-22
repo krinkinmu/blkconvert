@@ -8,6 +8,7 @@ struct blkio_stats {
 	__u64 last_time;
 	__u64 min_sector;
 	__u64 max_sector;
+	__u64 inversions;
 	__u32 reads;
 	__u32 writes;
 	__u32 bytes;
