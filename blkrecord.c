@@ -11,16 +11,16 @@
 
 #include "blktrace_api.h"
 #include "blkrecord.h"
+#include "algorithm.h"
+#include "file_io.h"
+#include "common.h"
+#include "debug.h"
 
 static const char *input_file_name;
 static const char *output_file_name;
 static unsigned long max_time_interval = 1000ul;
 static unsigned long max_batch_size = 10000ul;
 static int binary = 1;
-
-#define ERR(...)  fprintf(stderr, __VA_ARGS__)
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 static void show_usage(const char *name)
 {
@@ -119,41 +119,9 @@ static int parse_args(int argc, char **argv)
 struct blkio_event {
 	__u64 time;
 	__u64 sector;
-	__u32 bytes;
+	__u32 sectors;
 	__u32 action;
 };
-
-static int myread(int ifd, char *buf, size_t size)
-{
-	size_t rd = 0;
-
-	while (rd != size) {
-		ssize_t ret = read(ifd, buf + rd, size - rd);
-		if (ret < 0) {
-			perror("Error while reading input");
-			return 1;
-		}
-		if (!ret)
-			return 1;
-		rd += ret;
-	}
-	return 0;
-}
-
-static int mywrite(int ofd, const char *buf, size_t size)
-{
-	size_t wr = 0;
-
-	while (wr != size) {
-		ssize_t ret = write(ofd, buf + wr, size - wr);
-		if (ret < 0) {
-			perror("Error while writing output");
-			return 1;
-		}
-		wr += ret;
-	}
-	return 0;
-}
 
 static int trace_to_cpu(struct blk_io_trace *trace)
 {
@@ -177,6 +145,8 @@ static int trace_to_cpu(struct blk_io_trace *trace)
 
 static int read_event(int ifd, struct blkio_event *event)
 {
+	const __u32 sector_size = 512;
+
 	struct blk_io_trace trace;
 	size_t to_skip;
 
@@ -195,28 +165,24 @@ static int read_event(int ifd, struct blkio_event *event)
 		to_skip -= MIN(to_skip, 256); 
 	}
 
-	event->time   = trace.time;
-	event->sector = trace.sector;
-	event->bytes  = trace.bytes;
-	event->action = trace.action;
+	event->time    = trace.time;
+	event->sector  = trace.sector;
+	event->sectors = (trace.bytes + sector_size - 1) / sector_size;
+	event->action  = trace.action;
 
 	return 0;
 }
 
 static int queue_event(const struct blkio_event *event)
 {
-	if (((event->action & 0xFFFF) != __BLK_TA_QUEUE) ||
-			!(event->action & BLK_TC_ACT(BLK_TC_QUEUE)))
-		return 0;
-	return event->bytes != 0;
+	return ((event->action & 0xFFFF) == __BLK_TA_QUEUE) &&
+		(event->action & BLK_TC_ACT(BLK_TC_QUEUE));
 }
 
 static int complete_event(const struct blkio_event *event)
 {
-	if (((event->action & 0xFFFF) != __BLK_TA_COMPLETE) ||
-			!(event->action & BLK_TC_ACT(BLK_TC_COMPLETE)))
-		return 0;
-	return event->bytes != 0;
+	return ((event->action & 0xFFFF) == __BLK_TA_COMPLETE) &&
+		(event->action & BLK_TC_ACT(BLK_TC_COMPLETE));
 }
 
 static int accept_event(const struct blkio_event *event)
@@ -225,6 +191,9 @@ static int accept_event(const struct blkio_event *event)
 		return 0;
 
 	if (event->action & BLK_TC_ACT(BLK_TC_PC))
+		return 0;
+
+	if (!event->sectors)
 		return 0;
 
 	if (!queue_event(event) && !complete_event(event))
@@ -254,43 +223,16 @@ static int time_compare(const struct blkio_event *l,
 	return 0;
 }
 
-typedef int (*comparison_fn_t)(const void *, const void *);
-
 static void sort_events_by_time(struct blkio_event *events, size_t size)
 {
-	comparison_fn_t cmp = (comparison_fn_t)&time_compare;
-	qsort(events, size, sizeof(*events), cmp);
-}
-
-static const void *lower_bound(const void *key, const void *base, size_t num,
-			size_t size, comparison_fn_t cmp)
-{
-	size_t len = num;
-	const char *b = base;
-
-	while (len) {
-		const size_t half = len / 2;
-		const char * const m = b + half * size;
-
-		if (cmp(m, key) < 0) {
-			b = m + size;
-			len = len - half - 1;
-		} else {
-			len = half;
-		}
-	}
-	return b;
+	sort(events, size, &time_compare);
 }
 
 static size_t find_event_by_time(const struct blkio_event *events, size_t size,
 			__u64 time)
 {
-	comparison_fn_t cmp = (comparison_fn_t)&time_compare;
 	const struct blkio_event key = { .time = time };
-
-	const struct blkio_event *event = (const struct blkio_event *)
-			lower_bound(&key, events, size, sizeof(*events), cmp);
-	return event - events;
+	return lower_bound(events, size, key, &time_compare);
 }
 
 static int dump_stats(int ofd, const struct blkio_stats *stats)
@@ -304,7 +246,7 @@ static int dump_stats(int ofd, const struct blkio_stats *stats)
 	if (binary)
 		return mywrite(ofd, (const char *)stats, sizeof(*stats));
 
-	#define STAT_FMT "%llu %llu %llu %llu %llu %lu %lu %lu %lu\n"
+	#define STAT_FMT "%llu %llu %llu %llu %llu %lu %lu %lu %lu %lu\n"
 	ret = snprintf(buffer, 512, STAT_FMT,
 				(unsigned long long)stats->first_time,
 				(unsigned long long)stats->last_time,
@@ -313,7 +255,8 @@ static int dump_stats(int ofd, const struct blkio_stats *stats)
 				(unsigned long long)stats->inversions,
 				(unsigned long)stats->reads,
 				(unsigned long)stats->writes,
-				(unsigned long)stats->bytes,
+				(unsigned long)stats->sectors,
+				(unsigned long)stats->merged_sectors,
 				(unsigned long)stats->iodepth);
 	#undef STAT_FMT
 	if (ret < 0) {
@@ -323,78 +266,78 @@ static int dump_stats(int ofd, const struct blkio_stats *stats)
 	return mywrite(ofd, buffer, strlen(buffer));
 }
 
-static __u64 merge(struct blkio_event *evs, size_t lcount, size_t rcount,
+static __u64 merge_invs(struct blkio_event *lhs, size_t lcount,
+			struct blkio_event *rhs, size_t rcount,
 			struct blkio_event *buf)
 {
-	struct blkio_event *l = buf;
-	struct blkio_event *le = l + lcount;
-	struct blkio_event *r = evs + lcount;
-	struct blkio_event *re = r + rcount;
-	struct blkio_event *t = evs;
+	size_t l = 0, r = 0;
 	__u64 invs = 0;
 
-	memcpy(l, evs, sizeof(*l) * lcount);
-	for (; l != le && r != re; t++) {
-		if (r->sector < l->sector) {
-			memcpy(t, r++, sizeof(*r));
-			invs += le - l;
+	while (l != lcount && r != rcount) {
+		if (rhs[r].sector < lhs[l].sector) {
+			buf[r + l] = rhs[r];
+			invs += lcount - l;
+			++r;
 		} else {
-			memcpy(t, l++, sizeof(*l));
+			buf[r + l] = lhs[l];
+			++l;
 		}
 	}
-	if (l != le)
-		memcpy(t, l, (le - l) * sizeof(*l));
-	if (r != re)
-		memmove(t, r, (re - r) * sizeof(*r));
+
+	memcpy(buf + r + l, lhs + l, (lcount - l) * sizeof(*lhs));
+	memcpy(buf + r + l, rhs + r, (rcount - r) * sizeof(*rhs));
+
 	return invs;
 }
 
-static __u64 __count_invs(struct blkio_event *evs, size_t size,
+static __u64 count_invs(struct blkio_event *events, size_t size,
 				struct blkio_event *buf)
 {
 	size_t half;
-	__u64 li, ri;
+	__u64 invs;
 
 	if (size < 2)
 		return 0;
 
 	half = size / 2;
-	li = __count_invs(evs, half, buf);
-	ri = __count_invs(evs + half, size - half, buf);
-
-	return li + ri + merge(evs, half, size - half, buf);
+	invs = count_invs(events, half, buf);
+	invs += count_invs(events + half, size - half, buf);
+	invs += merge_invs(events, half, events + half, size - half, buf);
+	memcpy(events, buf, size * sizeof(*buf));
+	return invs;
 }
 
-static int count_inversions(struct blkio_event *evs, size_t size, __u64 *invs)
+static __u32 count_merged_sectors(struct blkio_event *events, size_t size)
 {
-	struct blkio_event *buf;
-	size_t i = 0, d = 0;
+	__u64 sectors = 0;
+	__u32 count = 0;
+	__u64 begin = 0, end = 0;
+	size_t i;
 
-	/* remove complete events */
-	for (; i != size; ++i) {
-		if (queue_event(evs + i))
-			memmove(evs + i - d, evs + i, sizeof(*evs));
-		else
-			++d;
+	for (i = 0; i != size; ++i) {
+		if (events[i].sector > end) {
+			sectors += end - begin;
+			++count;
+			begin = events[i].sector;
+			end = begin + events[i].sectors;
+		} else {
+			begin = MIN(begin, events[i].sector);
+			end = MAX(end, events[i].sector + events[i].sectors);
+		}
 	}
-	size -= d;
 
-	buf = calloc(1 + size / 2, sizeof(*evs));
-	if (!buf) {
-		ERR("Cannot allocate buffer for merge sort\n");
-		return 1;
-	}
+	sectors += end - begin;
+	++count;
 
-	*invs = __count_invs(evs, size, buf);
-	free(buf);
-	return 0;
+	return sectors / count;
 }
 
 static int account_events(int ofd, struct blkio_event *events, size_t size)
 {
+	struct blkio_event *buf;
 	struct blkio_stats stats;
-	__u64 total_bytes = 0, total_iodepth = 0;
-	__u32 rw_events = 0, id_events = 0, iodepth = 0;
+	__u64 total_sectors = 0, total_iodepth = 0;
+	__u32 id_events = 0, iodepth = 0;
 	size_t i;
 
 	if (!size)
@@ -403,20 +346,15 @@ static int account_events(int ofd, struct blkio_event *events, size_t size)
 	memset(&stats, 0, sizeof(stats));
 	stats.first_time = events[0].time;
 	stats.last_time = events[size - 1].time;
+	stats.min_sector = ~((__u64)0);
 	for (i = 0; i != size; ++i) {
 		if (queue_event(events + i)) {
-			if (rw_events == 1) {
-				stats.min_sector = events[i].sector;
-				stats.max_sector = events[i].sector;
-			}
-
 			stats.min_sector = MIN(stats.min_sector,
 						events[i].sector);
 			stats.max_sector = MAX(stats.max_sector,
 						events[i].sector);
-			total_bytes += events[i].bytes;
+			total_sectors += events[i].sectors;
 
-			++rw_events;
 			++iodepth;
 
 			if (events[i].action & BLK_TC_ACT(BLK_TC_WRITE))
@@ -428,7 +366,7 @@ static int account_events(int ofd, struct blkio_event *events, size_t size)
 				continue;
 
 			/* Account only local maximums */
-			if (i && queue_event(events + i - 1)) {
+			if (queue_event(events + i - 1)) {
 				total_iodepth += iodepth;
 				++id_events;
 			}
@@ -436,50 +374,39 @@ static int account_events(int ofd, struct blkio_event *events, size_t size)
 		}
 	}
 
+	if (!(stats.reads + stats.writes))
+		return 0;
+
 	if (iodepth) {
 		total_iodepth += iodepth;
 		++id_events;
 	}
 
-	if (rw_events)
-		stats.bytes = total_bytes / rw_events;
-
-	if (id_events)
-		stats.iodepth = total_iodepth / id_events;
-
-	if (count_inversions(events, size, &stats.inversions))
+	stats.sectors = total_sectors / (stats.reads + stats.writes);
+	stats.iodepth = total_iodepth / id_events;
+	size = remove_if(events, size, complete_event);
+	buf = calloc(size, sizeof(*buf));
+	if (!buf) {
+		ERR("Cannot allocate buffer for merge sort\n");
 		return 1;
+	}
+
+	stats.inversions = count_invs(events, size, buf);
+	free(buf);
+	stats.merged_sectors = count_merged_sectors(events, size);
 
 	return dump_stats(ofd, &stats);
-}
-
-static size_t process_events(int ofd, struct blkio_event *events, size_t size)
-{
-	const __u64 NS = 1000000ul;
-	__u64 end_time;
-	size_t pos = 0, count;
-
-	end_time = events[pos].time + max_time_interval * NS;
-	count = find_event_by_time(events, size, end_time);
-	do {
-		if (account_events(ofd, events + pos, count))
-			return 0;
-		pos += count;
-		end_time += max_time_interval * NS;
-		count = find_event_by_time(events + pos, size - pos, end_time);
-	} while (pos + count != size);
-
-	return pos;
 }
 
 static void blkrecord(int ifd, int ofd)
 {
 	const size_t buffer_size = max_batch_size;
+	const __u64 NS = 1000000ul;
+	const __u64 TI = max_time_interval * NS;
 
 	size_t size = 0, read = 0;
-	__u64 start_time = 0;
-	struct blkio_event *events = calloc(buffer_size,
-				sizeof(struct blkio_event));
+	__u64 time = 0;
+	struct blkio_event *events = calloc(buffer_size, sizeof(*events));
 
 	if (!events) {
 		ERR("Cannot allocate event buffer\n");
@@ -492,25 +419,36 @@ static void blkrecord(int ifd, int ofd)
 		size += read;
 		sort_events_by_time(events, size);
 
-		count = find_event_by_time(events, size, start_time);
+		count = find_event_by_time(events, size, time);
 		if (count) {
 			ERR("Discarded %lu unordered requests\n",
-				(unsigned long)count);
+						(unsigned long)count);
 			size -= count;
 			memmove(events, events + count, size);
 			continue;
 		}
 
-		count = process_events(ofd, events, size);
-		if (!count) {
+		count = find_event_by_time(events, size, events[0].time + TI);
+		if (account_events(ofd, events, count)) {
 			free(events);
 			return;
 		}
-		start_time = events[count - 1].time;
+		time = events[count - 1].time;
 		size -= count;
 		memmove(events, events + count, size);
 	}
-	process_events(ofd, events, size);
+
+
+	while (size) {
+		size_t count = find_event_by_time(events, size,
+					events[0].time + TI);
+		if (account_events(ofd, events, count)) {
+			free(events);
+			return;
+		}
+		size -= count;
+		memmove(events, events + count, size);
+	}
 	free(events);
 }
 

@@ -9,9 +9,10 @@ struct blkio_stats {
 	__u64 min_sector;
 	__u64 max_sector;
 	__u64 inversions;
+	__u32 merged_sectors;
+	__u32 sectors;
 	__u32 reads;
 	__u32 writes;
-	__u32 bytes;
 	__u32 iodepth;
 };
 

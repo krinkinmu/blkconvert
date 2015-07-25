@@ -12,8 +12,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "iocbcache.h"
+#include "object_cache.h"
 #include "blkrecord.h"
+#include "file_io.h"
+#include "common.h"
+#include "debug.h"
 
 static const __u64 sector_size = 512;
 
@@ -21,10 +24,6 @@ static const char *input_file_name;
 static const char *device_file_name;
 static unsigned number_of_events = 512;
 static int use_direct_io = 1;
-
-#define ERR(...)  fprintf(stderr, __VA_ARGS__)
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 static void show_usage(const char *name)
 {
@@ -110,23 +109,6 @@ static int parse_args(int argc, char **argv)
 	return 0;
 }
 
-static int myread(int ifd, char *buf, size_t size)
-{
-	size_t rd = 0;
-
-	while (rd != size) {
-		ssize_t ret = read(ifd, buf + rd, size - rd);
-		if (ret < 0) {
-			perror("Error while reading input file");
-			return 1;
-		}
-		if (!ret)
-			return 1;
-		rd += ret;
-	}
-	return 0;
-}
-
 static int read_sample(int ifd, struct blkio_stats *stats)
 {
 	return myread(ifd, (char *)stats, sizeof(*stats));
@@ -149,6 +131,19 @@ static __u64 random_u64(__u64 from, __u64 to)
 	for (gen = 0; gen < 64; gen += bits)
 		value |= (unsigned)rand() << gen;
 	return value % (to - from + 1) + from;
+}
+
+
+static struct object_cache *iocb_cache;
+
+static struct iocb *iocb_alloc(void)
+{
+	return object_cache_alloc(iocb_cache);
+}
+
+static void iocb_free(struct iocb *iocb)
+{
+	object_cache_free(iocb_cache, iocb);
 }
 
 static struct iocb *iocb_get(int fd, __u64 off, __u32 len, int rw)
@@ -314,7 +309,7 @@ static int iocbs_fill(struct iocb **iocbs, int fd,
 	const __u64 min_sec = stat->min_sector;
 	const __u64 max_sec = stat->max_sector;
 
-	__u32 bytes = stat->bytes;
+	__u32 bytes = stat->sectors * sector_size;
 	size_t reads = stat->reads, writes = stat->writes;
 	const size_t ios = reads + writes;
 	size_t i;
@@ -447,11 +442,11 @@ static void play(int ifd, int dfd)
 	io_context_t ctx = 0;
 	int ret;
 
-	iocb_cache_create();
+	iocb_cache = object_cache_create(sizeof(struct iocb));
 
 	if ((ret = io_setup(number_of_events, &ctx))) {
 		ERR("Cannot initialize AIO context (%d)\n", -ret);
-		iocb_cache_destroy();
+		object_cache_destroy(iocb_cache);
 		return;
 	}
 
@@ -461,7 +456,7 @@ static void play(int ifd, int dfd)
 	}
 
 	io_destroy(ctx);
-	iocb_cache_destroy();
+	object_cache_destroy(iocb_cache);
 }
 
 int main(int argc, char **argv)
