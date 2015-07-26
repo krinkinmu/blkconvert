@@ -1,7 +1,7 @@
 [global]
 ioengine=libaio
 iodepth=16
-size=1g
+size=512m
 bs=512
 numjobs=1
 filename=/dev/nullb0
