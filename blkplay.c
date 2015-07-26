@@ -310,29 +310,39 @@ static int iocbs_fill(struct iocb **iocbs, int fd,
 	const __u64 max_sec = stat->max_sector;
 
 	__u32 bytes = stat->sectors * sector_size;
+	__u32 spot_size = stat->merged_sectors * sector_size;
 	size_t reads = stat->reads, writes = stat->writes;
-	const size_t ios = reads + writes;
-	size_t i;
+	size_t i, j;
 	int rc;
 
 	if (use_direct_io)
 		bytes = (bytes + sector_size - 1) & ~(sector_size - 1);
 
-	for (i = 0; i != ios; ++i) {
+	for (i = 0; i != reads;) {
 		const __u64 off = sector_size * random_u64(min_sec, max_sec);
-		const int wr = random_u64(0, reads + writes) < reads;
 
-		iocbs[i] = iocb_get(fd, off, bytes, wr);
-		if (!iocbs[i]) {
-			iocbs_release(iocbs, i);
-			return 1;
+		for (j = 0; i != reads && j < spot_size; j += bytes, ++i) {
+			iocbs[i] = iocb_get(fd, off + j, bytes, 0);
+			if (!iocbs[i]) {
+				iocbs_release(iocbs, i);
+				return 1;
+			}
 		}
-
-		if (wr) --writes;
-		else --reads;
 	}
 
-	rc = iocbs_shuffle(iocbs, ios, stat->inversions);
+	for (i = reads; i != reads + writes;) {
+		const __u64 off = sector_size * random_u64(min_sec, max_sec);
+
+		for (j = 0; i != reads + writes && j < spot_size; j += bytes, ++i) {
+			iocbs[i] = iocb_get(fd, off + j, bytes, 1);
+			if (!iocbs[i]) {
+				iocbs_release(iocbs, i);
+				return 1;
+			}
+		}
+	}
+
+	rc = iocbs_shuffle(iocbs, reads + writes, stat->inversions);
 	return rc;
 }
 
