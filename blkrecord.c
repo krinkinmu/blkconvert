@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -346,6 +347,7 @@ static int account_events(int ofd, struct blkio_event *events, size_t size)
 	memset(&stats, 0, sizeof(stats));
 	stats.first_time = events[0].time;
 	stats.last_time = events[size - 1].time;
+	assert(stats.first_time <= stats.last_time);
 	stats.min_sector = ~((__u64)0);
 	for (i = 0; i != size; ++i) {
 		if (queue_event(events + i)) {
@@ -424,7 +426,7 @@ static void blkrecord(int ifd, int ofd)
 			ERR("Discarded %lu unordered requests\n",
 						(unsigned long)count);
 			size -= count;
-			memmove(events, events + count, size);
+			memmove(events, events + count, sizeof(*events) * size);
 			continue;
 		}
 
@@ -435,19 +437,20 @@ static void blkrecord(int ifd, int ofd)
 		}
 		time = events[count - 1].time;
 		size -= count;
-		memmove(events, events + count, size);
+		memmove(events, events + count, sizeof(*events) * size);
 	}
 
 
 	while (size) {
 		size_t count = find_event_by_time(events, size,
 					events[0].time + TI);
+		assert(count <= size);
 		if (account_events(ofd, events, count)) {
 			free(events);
 			return;
 		}
 		size -= count;
-		memmove(events, events + count, size);
+		memmove(events, events + count, sizeof(*events) * size);
 	}
 	free(events);
 }
