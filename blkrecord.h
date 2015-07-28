@@ -4,8 +4,7 @@
 #include <asm/types.h>
 
 struct blkio_stats {
-	__u64 first_time;
-	__u64 last_time;
+	__u64 q2q_time;
 	__u64 min_sector;
 	__u64 max_sector;
 	__u64 inversions;

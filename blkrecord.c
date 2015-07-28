@@ -287,10 +287,9 @@ static int blkio_stats_dump(int fd, const struct blkio_stats *stats)
 	if (binary)
 		return mywrite(fd, (const char *)stats, sizeof(*stats));
 
-	#define STAT_FMT "%llu %llu %llu %llu %llu %lu %lu %lu %lu %lu\n"
+	#define STAT_FMT "%llu %llu %llu %llu %lu %lu %lu %lu %lu\n"
 	ret = snprintf(buffer, 512, STAT_FMT,
-				(unsigned long long)stats->first_time,
-				(unsigned long long)stats->last_time,
+				(unsigned long long)stats->q2q_time,
 				(unsigned long long)stats->min_sector,
 				(unsigned long long)stats->max_sector,
 				(unsigned long long)stats->inversions,
@@ -455,6 +454,8 @@ static int account_general_stats(struct blkio_stats *stats,
 			else
 				++reads;
 			++iodepth;
+			begin = MIN(begin, events[i].time);
+			end = MAX(end, events[i].time);
 		} else if (iodepth) {
 			if (is_queue_event(events + i - 1)) {
 				total_iodepth += iodepth;
@@ -462,8 +463,6 @@ static int account_general_stats(struct blkio_stats *stats,
 			}
 			--iodepth;
 		}
-		begin = MIN(begin, events[i].time);
-		end = MAX(end, events[i].time);
 	}
 
 	if (iodepth) {
@@ -472,8 +471,7 @@ static int account_general_stats(struct blkio_stats *stats,
 	}
 
 	stats->iodepth = MAX(1, total_iodepth / count);
-	stats->first_time = begin;
-	stats->last_time = end;
+	stats->q2q_time = (end - begin) / (reads + writes);
 	stats->reads = reads;
 	stats->writes = writes;
 
