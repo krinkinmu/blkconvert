@@ -1,5 +1,4 @@
 #include <stddef.h>
-#include <string.h>
 #include "algorithm.h"
 
 size_t __lower_bound(char *ptr, size_t count, size_t size, const char *key,
@@ -20,17 +19,4 @@ size_t __lower_bound(char *ptr, size_t count, size_t size, const char *key,
 		}
 	}
 	return (ptr - begin) / size;
-}
-
-size_t __remove_if(char *ptr, size_t count, size_t size, filter_fn_t filter)
-{
-	char *src = ptr, *dst = ptr;
-
-	for (; src != ptr + count * size; src += size) {
-		if (filter(src))
-			continue;
-		memmove(dst, src, size);
-		dst += size;
-	}
-	return (dst - ptr) / size;
 }
