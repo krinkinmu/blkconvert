@@ -13,16 +13,17 @@
 #include <unistd.h>
 
 #include "object_cache.h"
+#include "algorithm.h"
 #include "blkrecord.h"
 #include "file_io.h"
 #include "common.h"
+#include "ctree.h"
 #include "debug.h"
-
-static const __u64 sector_size = 512;
 
 static const char *input_file_name;
 static const char *device_file_name;
-static unsigned number_of_events = 512;
+static unsigned number_of_events = 512u;
+static unsigned sector_size = 512u;
 static int use_direct_io = 1;
 
 static void show_usage(const char *name)
@@ -31,9 +32,11 @@ static void show_usage(const char *name)
 		" -d <device>           | --device=<device>\n" \
 		"[-f <input file>       | --file=<input file>]\n" \
 		"[-e <number of events> | --events=<number of events>]\n" \
+		"[-s <sector size>      | --sector=<sector size>]\n" \
 		"[-b                    | --buffered]\n" \
 		"\t-d Block device file. No default, must be specified.\n" \
 		"\t-f Use specified blkrecord file. Default: stdin\n" \
+		"\t-s Block device sector size. Default: 512\n" \
 		"\t-e Max number of concurrently processing events. Default: 512\n" \
 		"\t-b Use buffered IO (do not use direct IO)\n";
 
@@ -62,6 +65,12 @@ static int parse_args(int argc, char **argv)
 			.val = 'e'
 		},
 		{
+			.name = "sector",
+			.has_arg = required_argument,
+			.flag = NULL,
+			.val = 's'
+		},
+		{
 			.name = "buffered",
 			.has_arg = required_argument,
 			.flag = NULL,
@@ -71,9 +80,10 @@ static int parse_args(int argc, char **argv)
 			.name = NULL
 		}
 	};
-	static const char *opts = "f:d:e:b";
+	static const char *opts = "f:d:e:s:b";
 
-	int c, i;
+	long i;
+	int c;
 
 	while ((c = getopt_long(argc, argv, opts, long_opts, NULL)) >= 0) {
 		switch (c) {
@@ -84,12 +94,20 @@ static int parse_args(int argc, char **argv)
 			device_file_name = optarg;
 			break;
 		case 'e':
-			i = atoi(optarg);
+			i = atol(optarg);
 			if (i <= 0) {
 				ERR("Number of events must be positive\n");
 				return 1;
 			}
 			number_of_events = (unsigned)i;
+			break;
+		case 's':
+			i = atol(optarg);
+			if (i <= 0) {
+				ERR("Sector size must be positive\n");
+				return 1;
+			}
+			sector_size = (unsigned)i;
 			break;
 		case 'b':
 			use_direct_io = 0;
@@ -109,12 +127,10 @@ static int parse_args(int argc, char **argv)
 	return 0;
 }
 
-static int read_sample(int ifd, struct blkio_stats *stats)
-{
-	return myread(ifd, (char *)stats, sizeof(*stats));
-}
+static int blkio_stats_read(int fd, struct blkio_stats *stats)
+{ return myread(fd, (char *)stats, sizeof(*stats)); }
 
-static unsigned mylog2(__u64 x)
+static unsigned mylog2(unsigned long long x)
 {
 	unsigned bits;
 	for (bits = 0; x; x >>= 1)
@@ -122,18 +138,21 @@ static unsigned mylog2(__u64 x)
 	return bits;
 }
 
-static __u64 random_u64(__u64 from, __u64 to)
+static unsigned long long myrandom(unsigned long long from,
+			unsigned long long to)
 {
-	const unsigned bits = mylog2((__u64)RAND_MAX);
-	__u64 value = 0;
+	const unsigned bits = mylog2(RAND_MAX);
+	unsigned long long value = 0;
 	unsigned gen;
 
-	for (gen = 0; gen < 64; gen += bits)
-		value |= (unsigned)rand() << gen;
+	for (gen = 0; gen < sizeof(value) * 8; gen += bits)
+		value |= (unsigned long long)rand() << gen;
 	return value % (to - from + 1) + from;
 }
 
-
+/**
+ * struct iocb management routines (cached allocation and release mostly).
+ */
 static struct object_cache *iocb_cache;
 
 static struct iocb *iocb_alloc(void)
@@ -146,7 +165,8 @@ static void iocb_free(struct iocb *iocb)
 	object_cache_free(iocb_cache, iocb);
 }
 
-static struct iocb *iocb_get(int fd, __u64 off, __u32 len, int rw)
+static struct iocb *iocb_get(int fd, unsigned long long off, unsigned long len,
+			int rw)
 {
 	struct iocb *iocb;
 	void *buf;
@@ -184,7 +204,8 @@ static void iocbs_release(struct iocb **iocbs, size_t count)
 		iocb_release(iocbs[i]);
 }
 
-static int offset_compare(const struct iocb **l, const struct iocb **r)
+
+static int iocb_offset_compare(const struct iocb **l, const struct iocb **r)
 {
 	if ((*l)->u.c.offset < (*r)->u.c.offset)
 		return -1;
@@ -193,136 +214,146 @@ static int offset_compare(const struct iocb **l, const struct iocb **r)
 	return 0;
 }
 
-typedef int (*comparison_fn_t)(const void *, const void *);
+/**
+ * iocbs_sort - sorts iocbs pointers by offset in ascending order
+ */
+static void iocbs_sort(struct iocb **iocbs, size_t size)
+{ sort(iocbs, size, &iocb_offset_compare); }
 
-static void iocbs_sort_by_offset(struct iocb **iocbs, size_t size)
-{
-	comparison_fn_t cmp = (comparison_fn_t)&offset_compare;
-	qsort(iocbs, size, sizeof(*iocbs), cmp);
-}
 
-struct ctree {
+/**
+ * We use implicit cartesian tree instead mere array, because we need
+ * effectively remove items from middle.
+ */
+struct iocb_ctree {
+	struct ctree link;
 	struct iocb *iocb;
-	size_t size;
-	int prio;
-	struct ctree *left;
-	struct ctree *right;
 };
 
-static size_t csize(struct ctree *tree)
-{ return tree ? tree->size : 0; }
-
-static struct ctree *cmerge(struct ctree *l, struct ctree *r)
+static void iocb_ctree_node_init(struct iocb_ctree *tree, struct iocb *iocb)
 {
-	if (!l) return r;
-	if (!r) return l;
-
-	if (l->prio > r->prio) {
-		l->right = cmerge(l->right, r);
-		l->size = csize(l->left) + csize(l->right) + 1;
-		return l;
-	}
-	r->left = cmerge(l, r->left);
-	r->size = csize(r->left) + csize(r->right) + 1;
-	return r;
+	cinit(&tree->link);
+	tree->iocb = iocb;
 }
 
-static void csplit(struct ctree *tree, size_t idx, struct ctree **l,
-			struct ctree **r)
+/**
+ * iocb_ctree_append - append node to the end of tree.
+ *
+ * tree - pointer to pointer to tree to append to :)
+ * node - new node to insert.
+ */
+static void iocb_ctree_append(struct ctree **tree, struct iocb_ctree *node)
+{ *tree = cappend(*tree, &node->link); }
+
+/**
+ * iocb_ctree_extract - removes idx node from the tree, and returns pointer.
+ *
+ * tree - tree to remove item from
+ * idx - item index (starting from 0)
+ *
+ * NODE: tree MUST contain at least idx items.
+ */
+static struct iocb_ctree *iocb_ctree_extract(struct ctree **tree,
+			size_t idx)
 {
-	size_t cur;
+	struct ctree *node;
 
-	if (!tree) {
-		*l = 0;
-		*r = 0;
-		return;
-	}
-
-	cur = csize(tree->left) + 1;
-	if (cur <= idx) {
-		csplit(tree->right, idx - cur, &tree->right, r);
-		*l = tree;
-	} else {
-		csplit(tree->left, idx, l, &tree->left);
-		*r = tree;
-	}
-	tree->size = csize(tree->left) + csize(tree->right) + 1;
+	assert(idx < csize(*tree) && "Tree is too small");
+	*tree = cextract(*tree, idx, &node);
+	assert(node && "Node must not be NULL");
+	return centry(node, struct iocb_ctree, link);
 }
 
-static void cextract(struct ctree **tree, size_t idx, struct ctree **node)
-{
-	struct ctree *l, *r;
-
-	csplit(*tree, idx, &l, &r);
-	csplit(r, 1, node, &r);
-	*tree = cmerge(l, r);
-}
-
-static __u64 max_invs(__u64 items)
+static unsigned long long max_invs(unsigned long long items)
 { return items * (items - 1) / 2; }
 
-static int iocbs_shuffle(struct iocb **iocbs, size_t size, __u64 invs)
+/**
+ * iocbs_shuffle - shuffles iocbs so that number of inversions
+ *                 approximately equal to invs.
+ *
+ * iocbs - pointers to iocb pointers to shuffle
+ * size - number of iocbs
+ * inv - number of inversions
+ *
+ * NOTE: invs MUST be less or equal to max_invs(size), otherwise
+ *       it is impossible to generate appropriate permutation.
+ *
+ * NOTE: actual number of inversions is less or equal to invs,
+ *       because iocbs can contain items with same offset, even
+ *       though permutation contains exactly invs inversions.
+ */
+static int iocbs_shuffle(struct iocb **iocbs, size_t size,
+			unsigned long long invs)
 {
 	struct ctree *tree = 0;
-	struct ctree *nodes;
+	struct iocb_ctree *nodes;
 	size_t i;
 
-	nodes = calloc(size, sizeof(struct ctree));
+	nodes = calloc(size, sizeof(struct iocb_ctree));
 	if (!nodes) {
 		ERR("Cannot allocate cartesian tree nodes\n");
 		return 1;
 	}
 
-	iocbs_sort_by_offset(iocbs, size);
+	iocbs_sort(iocbs, size);
 	for (i = 0; i != size; ++i) {
-		nodes[i].iocb = iocbs[i];
-		nodes[i].prio = rand();
-		nodes[i].size = 1;
-		nodes[i].left = 0;
-		nodes[i].right = 0;
-		tree = cmerge(tree, nodes + i);
+		iocb_ctree_node_init(nodes + i, iocbs[i]);
+		iocb_ctree_append(&tree, nodes + i);
 	}
 
 	for (i = 0; i != size; ++i) {
-		const __u64 rem = size - i - 1;
-		const __u64 min = max_invs(rem) < invs
+		const unsigned long long rem = size - i - 1;
+		const unsigned long long min = max_invs(rem) < invs
 					? invs - max_invs(rem) : 0;
-		const __u64 max = MIN(invs, rem);
-		const __u64 idx = random_u64(min, max);
-		struct ctree *node;
+		const unsigned long long max = MIN(invs, rem);
+		const unsigned long long idx = myrandom(min, max);
 
 		assert(min <= max && "Wrong inversions limits");
 		assert(idx <= max && idx >= min && "Wrong item index");
-		assert(idx < csize(tree) && "Tree is too small");
-		cextract(&tree, idx, &node);
-		iocbs[i] = node->iocb;
+
+		iocbs[i] = iocb_ctree_extract(&tree, idx)->iocb;
 		invs -= idx;
 	}
-
 	free(nodes);
 	return 0;
 }
 
+/**
+ * iocbs_fill - genreates iocbs accoriding to stat. Number of
+ *              iocbs to generate is stat->reads + stats->writes.
+ *
+ * iocbs - array large enough to store appropriate number of iocb
+ *         pointers
+ * fd - file descriptor to work with
+ * stat - IO parameters.
+ */
 static int iocbs_fill(struct iocb **iocbs, int fd,
 			const struct blkio_stats *stat)
 {
-	const __u64 min_sec = stat->min_sector;
-	const __u64 max_sec = stat->max_sector;
+	const unsigned long long min_sec = stat->min_sector;
+	const unsigned long long max_sec = stat->max_sector;
+	const unsigned long long spot_sectors = stat->merged_sectors;
+	const unsigned long long spot_bytes = sector_size * spot_sectors;
 
-	__u32 bytes = stat->sectors * sector_size;
-	__u32 spot_size = stat->merged_sectors * sector_size;
-	size_t reads = stat->reads, writes = stat->writes;
-	size_t i, j;
-	int rc;
+	const size_t reads = stat->reads;
+	const size_t writes = stat->writes;
+	const size_t ios = reads + writes;
+
+	unsigned long long bytes = stat->sectors * sector_size;
+	size_t i;
 
 	if (use_direct_io)
 		bytes = (bytes + sector_size - 1) & ~(sector_size - 1);
 
-	for (i = 0; i != reads;) {
-		const __u64 off = sector_size * random_u64(min_sec, max_sec);
+	for (i = 0; i != ios;) {
+		const unsigned long long off = sector_size * myrandom(min_sec,
+					max_sec - spot_sectors);
+		unsigned long long j;
 
-		for (j = 0; i != reads && j < spot_size; j += bytes, ++i) {
-			iocbs[i] = iocb_get(fd, off + j, bytes, 0);
+		for (j = 0; i != ios && j < spot_bytes; j += bytes, ++i) {
+			const int wr = i < writes;
+
+			iocbs[i] = iocb_get(fd, off + j, bytes, wr);
 			if (!iocbs[i]) {
 				iocbs_release(iocbs, i);
 				return 1;
@@ -330,22 +361,18 @@ static int iocbs_fill(struct iocb **iocbs, int fd,
 		}
 	}
 
-	for (i = reads; i != reads + writes;) {
-		const __u64 off = sector_size * random_u64(min_sec, max_sec);
-
-		for (j = 0; i != reads + writes && j < spot_size; j += bytes, ++i) {
-			iocbs[i] = iocb_get(fd, off + j, bytes, 1);
-			if (!iocbs[i]) {
-				iocbs_release(iocbs, i);
-				return 1;
-			}
-		}
-	}
-
-	rc = iocbs_shuffle(iocbs, reads + writes, stat->inversions);
-	return rc;
+	return iocbs_shuffle(iocbs, ios, stat->inversions);
 }
 
+/**
+ * iocbs_submit - submits exactly count IOs from iocbs array.
+ *
+ * ctx - aio context
+ * iocbs - array of at least count iocbs
+ * count - number of IOs to submit
+ *
+ * Returns 0, if success.
+ */
 static int iocbs_submit(io_context_t ctx, struct iocb **iocbs, size_t count)
 {
 	size_t sb = 0;
@@ -361,7 +388,12 @@ static int iocbs_submit(io_context_t ctx, struct iocb **iocbs, size_t count)
 	return 0;
 }
 
-static int check_events(const struct io_event *events, size_t count)
+/**
+ * io_events_check - check events array filled with io_getevents. If at least
+ *                   one of io_event reports error function print detailed info
+ *                   to stderr and returns 1.
+ */
+static int io_events_check(const struct io_event *events, size_t count)
 {
 	size_t i;
 
@@ -384,7 +416,16 @@ static int check_events(const struct io_event *events, size_t count)
 	return 0;
 }
 
-static int play_sample(io_context_t ctx, int fd,
+/**
+ * blkio_stats_play - generate, submit and recalim IOs.
+ *
+ * ctx - aio context
+ * fd - file descriptor to work with (a.k.a block device)
+ * stat - IOs parameters
+ *
+ * Returns 0, if success.
+ */
+static int blkio_stats_play(io_context_t ctx, int fd,
 			const struct blkio_stats *stat)
 {
 	const size_t ios = stat->reads + stat->writes;
@@ -434,7 +475,7 @@ static int play_sample(io_context_t ctx, int fd,
 		}
 		reclaim_i += ret;
 
-		if (check_events(events, ret)) {
+		if (io_events_check(events, ret)) {
 			rc = 1;
 			break;
 		}
@@ -460,8 +501,8 @@ static void play(int ifd, int dfd)
 		return;
 	}
 
-	while (!read_sample(ifd, &stat)) {
-		if (play_sample(ctx, dfd, &stat))
+	while (!blkio_stats_read(ifd, &stat)) {
+		if (blkio_stats_play(ctx, dfd, &stat))
 			break;
 	}
 
