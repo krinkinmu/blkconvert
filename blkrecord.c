@@ -18,9 +18,9 @@
 
 static const char *input_file_name;
 static const char *output_file_name;
-static unsigned long max_time_interval = 1000ul;
+static unsigned max_time_interval = 1000u;
 static unsigned long max_batch_size = 10000ul;
-static unsigned long sector_size = 512ul;
+static unsigned sector_size = 512u;
 static int binary = 1;
 
 static void show_usage(const char *name)
