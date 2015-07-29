@@ -85,7 +85,7 @@ static int parse_args(int argc, char **argv)
 			.name = NULL
 		}
 	};
-	static const char *opts = "f:o:i:b:t";
+	static const char *opts = "f:o:i:b:s:t";
 
 	long i;
 	int c;
