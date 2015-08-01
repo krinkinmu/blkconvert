@@ -430,6 +430,7 @@ static int blkio_stats_play(io_context_t ctx, int fd,
 {
 	const size_t ios = stat->reads + stat->writes;
 	const size_t iodepth = MIN(stat->iodepth, number_of_events);
+	const size_t batch = stat->batch;
 	struct iocb **iocbs;
 	struct io_event *events;
 	size_t submit_i, reclaim_i;
@@ -454,20 +455,26 @@ static int blkio_stats_play(io_context_t ctx, int fd,
 		return 1;
 	}
 
-	reclaim_i = 0;
-	submit_i = 0;
+	reclaim_i = submit_i = 0;
 	while (reclaim_i != ios) {
-		const size_t running = submit_i - reclaim_i;
-		const size_t todo = MIN(ios - submit_i, iodepth - running);
+		size_t remain = ios - submit_i;
+		size_t todo = MIN(batch, remain);
+		size_t running;
 		int ret;
 
 		if (iocbs_submit(ctx, iocbs + submit_i, todo)) {
 			rc = 1;
 			break;
 		}
-
 		submit_i += todo;
-		ret = io_getevents(ctx, 1, submit_i - reclaim_i, events, NULL);
+
+		running = submit_i - reclaim_i;
+		remain = ios - submit_i;
+		todo = 1;
+		if (iodepth - running < batch)
+			todo = MIN(running, batch - (iodepth - running));
+
+		ret = io_getevents(ctx, todo, iodepth, events, NULL);
 		if (ret < 0) {
 			ERR("Error %d, while reclaiming IO\n", -ret);
 			rc = 1;
