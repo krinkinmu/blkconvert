@@ -13,6 +13,7 @@ struct blkio_stats {
 	__u32 reads;
 	__u32 writes;
 	__u32 iodepth;
+	__u32 batch;
 };
 
 #endif /*__BLKRECORD_H__*/

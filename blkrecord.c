@@ -287,7 +287,7 @@ static int blkio_stats_dump(int fd, const struct blkio_stats *stats)
 	if (binary)
 		return mywrite(fd, (const char *)stats, sizeof(*stats));
 
-	#define STAT_FMT "%llu %llu %llu %llu %lu %lu %lu %lu %lu\n"
+	#define STAT_FMT "%llu %llu %llu %llu %lu %lu %lu %lu %lu %lu\n"
 	ret = snprintf(buffer, 512, STAT_FMT,
 				(unsigned long long)stats->q2q_time,
 				(unsigned long long)stats->min_sector,
@@ -297,7 +297,8 @@ static int blkio_stats_dump(int fd, const struct blkio_stats *stats)
 				(unsigned long)stats->writes,
 				(unsigned long)stats->sectors,
 				(unsigned long)stats->merged_sectors,
-				(unsigned long)stats->iodepth);
+				(unsigned long)stats->iodepth,
+				(unsigned long)stats->batch);
 	#undef STAT_FMT
 	if (ret < 0) {
 		ERR("Error while formating text output\n");
@@ -444,7 +445,7 @@ static int account_general_stats(struct blkio_stats *stats,
 {
 	unsigned long total_iodepth = 0, iodepth = 0, count = 0;
 	unsigned long long begin = ~0ull, end = 0;
-	unsigned long reads = 0, writes = 0;
+	unsigned long reads = 0, writes = 0, rw_bursts = 0;
 	size_t i;
 
 	for (i = 0; i != size; ++i) {
@@ -456,14 +457,25 @@ static int account_general_stats(struct blkio_stats *stats,
 			++iodepth;
 			begin = MIN(begin, events[i].time);
 			end = MAX(end, events[i].time);
-		} else if (iodepth) {
+		} else {
+			if (!iodepth)
+				continue;
 			if (is_queue_event(events + i - 1)) {
 				total_iodepth += iodepth;
+				++rw_bursts;
 				++count;
 			}
 			--iodepth;
 		}
 	}
+
+	if (reads + writes == 0)
+		return 1;
+
+	if (is_queue_event(events + size - 1))
+		++rw_bursts;
+
+	stats->batch = (reads + writes + rw_bursts - 1) / rw_bursts;
 
 	if (iodepth) {
 		total_iodepth += iodepth;
