@@ -378,7 +378,8 @@ static int iocbs_submit(io_context_t ctx, struct iocb **iocbs, size_t count)
 	size_t sb = 0;
 
 	while (sb != count) {
-		int ret = io_submit(ctx, count - sb, iocbs + sb);
+		const int ret = io_submit(ctx, count - sb, iocbs + sb);
+
 		if (ret < 0) {
 			ERR("Error %d, while submiting IO\n", -ret);
 			return 1;
@@ -458,8 +459,8 @@ static int blkio_stats_play(io_context_t ctx, int fd,
 	reclaim_i = submit_i = 0;
 	while (reclaim_i != ios) {
 		size_t remain = ios - submit_i;
-		size_t todo = MIN(batch, remain);
-		size_t running;
+		size_t running = submit_i - reclaim_i;
+		size_t todo = MIN(iodepth - running, remain);
 		int ret;
 
 		if (iocbs_submit(ctx, iocbs + submit_i, todo)) {
