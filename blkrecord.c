@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -209,6 +210,11 @@ static int is_complete_event(const struct blkio_event *event)
 		(event->action & BLK_TC_ACT(BLK_TC_COMPLETE));
 }
 
+static int is_write_event(const struct blkio_event *event)
+{
+	return (event->action & BLK_TC_ACT(BLK_TC_WRITE)) != 0;
+}
+
 static int accept_event(const struct blkio_event *event)
 {
 	/* Drop notify, SCSI and empty events */
@@ -257,12 +263,30 @@ static int blkio_event_time_compare(const struct blkio_event *l,
 	return 0;
 }
 
+static int blkio_event_offset_compare(const struct blkio_event *l,
+			const struct blkio_event *r)
+{
+	if (l->sector < r->sector)
+		return -1;
+	if (l->sector > r->sector)
+		return 1;
+	return 0;
+}
+
 /**
- * blkio_events_sort - sorts events by time in ascending order
+ * blkio_events_sort_by_time - sorts events by time in ascending order
  */
-static void blkio_events_sort(struct blkio_event *events, size_t size)
+static void blkio_events_sort_by_time(struct blkio_event *events, size_t size)
 {
 	sort(events, size, &blkio_event_time_compare);
+}
+
+/**
+ * blkio_events_sort_by_offset - sort events by offset in ascending order
+ */
+static void blkio_events_sort_by_offset(struct blkio_event *events, size_t size)
+{
+	sort(events, size, &blkio_event_offset_compare);
 }
 
 /**
@@ -271,39 +295,45 @@ static void blkio_events_sort(struct blkio_event *events, size_t size)
  *                     Returns position of such event in array ot size,
  *                     if no such event found. (a. k. a. lower_bound).
  */
-static size_t blkio_events_find(const struct blkio_event *events, size_t size,
-			__u64 time)
+static size_t blkio_events_find_by_time(const struct blkio_event *events,
+			size_t size, __u64 time)
 {
 	const struct blkio_event key = { .time = time };
-
 	return lower_bound(events, size, key, &blkio_event_time_compare);
 }
 
 static int blkio_stats_dump(int fd, const struct blkio_stats *stats)
 {
+	unsigned long long first = ~0ull, last = 0ull;
 	char buffer[512];
-	int ret;
+
+	if (stats->reads + stats->writes == 0)
+		return 0;
 
 	if (binary)
 		return mywrite(fd, (const char *)stats, sizeof(*stats));
 
-	#define STAT_FMT "%llu %llu %llu %llu %lu %lu %lu %lu %lu %lu\n"
-	ret = snprintf(buffer, 512, STAT_FMT,
+	if (stats->reads) {
+		first = MIN(first, stats->reads_layout.first_sector);
+		last = MAX(last, stats->reads_layout.last_sector);
+	}
+
+	if (stats->writes) {
+		first = MIN(first, stats->writes_layout.first_sector);
+		last = MAX(last, stats->writes_layout.last_sector);
+	}
+
+	snprintf(buffer, 512, "q2q=%llu inversions=%llu reads=%lu writes=%lu "
+				"avg_iodepth=%lu avg_batch=%lu "
+				"first_sec=%llu last_sec=%llu\n",
 				(unsigned long long)stats->q2q_time,
-				(unsigned long long)stats->min_sector,
-				(unsigned long long)stats->max_sector,
 				(unsigned long long)stats->inversions,
 				(unsigned long)stats->reads,
 				(unsigned long)stats->writes,
-				(unsigned long)stats->sectors,
-				(unsigned long)stats->merged_sectors,
 				(unsigned long)stats->iodepth,
-				(unsigned long)stats->batch);
-	#undef STAT_FMT
-	if (ret < 0) {
-		ERR("Error while formating text output\n");
-		return 1;
-	}
+				(unsigned long)stats->batch,
+				first, last);
+
 	return mywrite(fd, buffer, strlen(buffer));
 }
 
@@ -363,53 +393,60 @@ static unsigned long long __ci_merge_sort(struct blkio_event *events,
 	return invs;
 }
 
+static unsigned ilog2(unsigned long long x)
+{
+	unsigned power = 0;
+	while (x >>= 1)
+		++power;
+	return power;
+}
+
 /**
- * __cm_avg_block_size - merges contigous events and calculate average
- *                        size of merged block. Note that function makes
- *                        no difference between reads and writes, queue
- *                        and complete events.
- * 
- * events - array of events sorted by offset in ascending order
- * size - number of items in events.
+ * __account_disk_layout - account information about block size, first and
+ *                         last accessed sectors, size of merged blocks and
+ *                         distance between merged blocks.
  */
-static unsigned long __cm_avg_merged_block_size(
+static void __account_disk_layout(struct blkio_disk_layout *layout,
 			const struct blkio_event *events, size_t size)
 {
+	__u32 *ss = layout->io_size;
+	__u32 *ms = layout->merged_size;
+	__u32 *so = layout->spot_offset;
 	unsigned long long begin, end;
-	unsigned long total_size = 0;
-	size_t i, count = 0;
+	unsigned long long off, len;
+	size_t i;
 
 	if (!size)
-		return 0;
+		return;
 
 	begin = events[0].sector;
 	end = begin + events[0].length;
+	layout->first_sector = begin;
 	for (i = 0; i != size; ++i) {
-		const unsigned long long off = events[i].sector;
-		const unsigned long len = events[i].length;
+		off = events[i].sector;
+		len = events[i].length;
 
+		assert(len && "Empty operations aren't permitted here");
+
+		++ss[MIN(ilog2(len), SECTOR_SIZE_BITS - 1)];
 		if (off > end) {
-			total_size += end - begin;
-			++count;
+			++ms[MIN(ilog2(end - begin), SECTOR_SIZE_BITS - 1)];
+			++so[MIN(ilog2(off - end), SPOT_OFFSET_BITS - 1)];
+
 			begin = off;
-			end = off + len;
-			continue;
+			end = begin + len;
 		}
 		end = MAX(end, off + len);
 	}
 
-	total_size += end - begin;
-	++count;
-
-	return total_size / count;
+	layout->last_sector = end;
+	++ms[MIN(ilog2(end - begin), SECTOR_SIZE_BITS - 1)];
 }
 
 static int account_disk_layout_stats(struct blkio_stats *stats,
 			const struct blkio_event *events, size_t size)
 {
 	struct blkio_event *buffer = calloc(2 * size, sizeof(*events));
-	unsigned long long low = ~0ull, high = 0ull;
-	unsigned long total_sectors = 0, count = 0;
 	size_t i, j;
 
 	if (!buffer) {
@@ -420,22 +457,26 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 	for (i = 0, j = 0; i != size; ++i) {
 		if (!is_queue_event(events + i))
 			continue;
-		memcpy(buffer + j, events + i, sizeof(*buffer));
-		total_sectors += events[i].length;
-		++count;
-		high = MAX(high, events[i].sector + events[i].length);
-		low = MIN(low, events[i].sector);
-		++j;
+		memcpy(buffer + j++, events + i, sizeof(*buffer));
 	}
-
-	if (!j)
-		return 0;
-
 	stats->inversions = __ci_merge_sort(buffer, j, buffer + j);
-	stats->merged_sectors = __cm_avg_merged_block_size(buffer, j);
-	stats->sectors = total_sectors / count;
-	stats->min_sector = low;
-	stats->max_sector = high;
+
+	for (i = 0, j = 0; i != size; ++i) {
+		if (!is_queue_event(events + i) || is_write_event(events + i))
+			continue;
+		memcpy(buffer + j++, events + i, sizeof(*buffer));
+	}
+	blkio_events_sort_by_offset(buffer, j);
+	__account_disk_layout(&stats->reads_layout, buffer, j);
+
+	for (i = 0, j = 0; i != size; ++i) {
+		if (!is_queue_event(events + i) || !is_write_event(events + i))
+			continue;
+		memcpy(buffer + j++, events + i, sizeof(*buffer));
+	}
+	blkio_events_sort_by_offset(buffer, j);
+	__account_disk_layout(&stats->writes_layout, buffer, j);
+
 	free(buffer);
 	return 0;
 }
@@ -450,7 +491,7 @@ static int account_general_stats(struct blkio_stats *stats,
 
 	for (i = 0; i != size; ++i) {
 		if (is_queue_event(events + i)) {
-			if (events[i].action & BLK_TC_ACT(BLK_TC_WRITE))
+			if (is_write_event(events + i))
 				++writes;
 			else
 				++reads;
@@ -470,7 +511,7 @@ static int account_general_stats(struct blkio_stats *stats,
 	}
 
 	if (reads + writes == 0)
-		return 1;
+		return 0;
 
 	if (is_queue_event(events + size - 1))
 		++rw_bursts;
@@ -525,8 +566,8 @@ static void blkrecord(int ifd, int ofd)
 		size_t count;
 
 		size += read;
-		blkio_events_sort(events, size);
-		count = blkio_events_find(events, size, time);
+		blkio_events_sort_by_time(events, size);
+		count = blkio_events_find_by_time(events, size, time);
 		if (count) {
 			ERR("Discarded %lu unordered requests\n",
 						(unsigned long)count);
@@ -535,7 +576,8 @@ static void blkrecord(int ifd, int ofd)
 			continue;
 		}
 
-		count = blkio_events_find(events, size, events[0].time + TI);
+		count = blkio_events_find_by_time(events, size,
+					events[0].time + TI);
 		if (account_events(ofd, events, count)) {
 			free(events);
 			return;
@@ -549,7 +591,8 @@ static void blkrecord(int ifd, int ofd)
 	while (size) {
 		size_t count;
 
-		count = blkio_events_find(events, size, events[0].time + TI);
+		count = blkio_events_find_by_time(events, size,
+					events[0].time + TI);
 		if (account_events(ofd, events, count)) {
 			free(events);
 			return;
