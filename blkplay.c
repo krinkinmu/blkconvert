@@ -147,7 +147,7 @@ static unsigned long long myrandom(unsigned long long from,
 
 	for (gen = 0; gen < sizeof(value) * 8; gen += bits)
 		value |= (unsigned long long)rand() << gen;
-	return value % (to - from + 1) + from;
+	return value % (to - from) + from;
 }
 
 /**
@@ -307,7 +307,7 @@ static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 		const unsigned long long min = max_invs(rem) < invs
 					? invs - max_invs(rem) : 0;
 		const unsigned long long max = MIN(invs, rem);
-		const unsigned long long idx = myrandom(min, max);
+		const unsigned long long idx = myrandom(min, max + 1);
 
 		assert(min <= max && "Wrong inversions limits");
 		assert(idx <= max && idx >= min && "Wrong item index");
@@ -319,63 +319,118 @@ static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 	return 0;
 }
 
-static unsigned long long first_sector(const struct blkio_stats *stat)
+#define RANDOM_SHUFFLE(array, size, type) \
+	do { \
+		const size_t __size = (size); \
+		type *__array = (array); \
+		size_t __i; \
+		if (__size < 2) \
+			break; \
+		for (__i = 0; __i != __size - 1; ++__i) { \
+			const size_t pos = myrandom(__i, __size); \
+			const type tmp = __array[pos]; \
+			__array[pos] = __array[__i]; \
+			__array[__i] = tmp; \
+		} \
+	} while (0)
+
+static int __iocbs_fill(struct iocb **iocbs, int fd, int wr,
+			const struct blkio_disk_layout *dl)
 {
-	unsigned long long sec = ~0ull;
+	const unsigned long long first = dl->first_sector;
+	const unsigned long long last = dl->last_sector;
 
-	if (stat->reads)
-		sec = MIN(sec, stat->reads_layout.first_sector);
-	
-	if (stat->writes)
-		sec = MIN(sec, stat->writes_layout.first_sector);
+	unsigned long *spot_size, *io_size;
+	unsigned long long *spot_offset;
+	unsigned long long offset;
+	unsigned long spot, spots = 0, ios = 0;
 
-	return sec;
-}
+	size_t i, j;
 
-static unsigned long long last_sector(const struct blkio_stats *stat)
-{
-	unsigned long long sec = 0ull;
+	for (i = 0; i != SECTOR_SIZE_BITS; ++i)
+		ios += dl->io_size[i];
 
-	if (stat->reads)
-		sec = MAX(sec, stat->reads_layout.last_sector);
-	
-	if (stat->writes)
-		sec = MAX(sec, stat->writes_layout.last_sector);
+	if (!ios)
+		return 0;
 
-	return sec;
-}
+	for (i = 0; i != SECTOR_SIZE_BITS; ++i)
+		spots += dl->merged_size[i];
 
-static unsigned long avg_spot_sectors(const struct blkio_stats *stat)
-{
-	const struct blkio_disk_layout *rdl = &stat->reads_layout;
-	const struct blkio_disk_layout *wdl = &stat->writes_layout;
-	unsigned long total_sectors = 0, count = 0;
-	size_t i;
-
-	for (i = 0; i != SECTOR_SIZE_BITS; ++i) {
-		total_sectors += (1ul << i) * rdl->merged_size[i];
-		count += rdl->merged_size[i];
-		total_sectors += (1ul << i) * wdl->merged_size[i];
-		count += wdl->merged_size[i];
+	io_size = calloc(ios, sizeof(*io_size));
+	if (!io_size) {
+		ERR("Cannot allocate array of IO sizes\n");
+		return 1;
 	}
 
-	return total_sectors / count;
-}
-
-static unsigned long avg_io_sectors(const struct blkio_stats *stat)
-{
-	const struct blkio_disk_layout *rdl = &stat->reads_layout;
-	const struct blkio_disk_layout *wdl = &stat->writes_layout;
-	unsigned long total_sectors = 0, count = 0;
-	size_t i;
-
-	for (i = 0; i != SECTOR_SIZE_BITS; ++i) {
-		total_sectors += (1ul << i) * rdl->io_size[i];
-		count += rdl->io_size[i];
-		total_sectors += (1ul << i) * wdl->io_size[i];
-		count += wdl->io_size[i];
+	spot_size = calloc(spots, sizeof(*spot_size));
+	if (!spot_size) {
+		ERR("Cannot allocate array of spot sizes\n");
+		free(io_size);
+		return 1;
 	}
-	return total_sectors / count;
+
+	spot_offset = calloc(spots, sizeof(*spot_offset));
+	if (!spot_offset) {
+		ERR("Cannot allocate array of spot offsets\n");
+		free(spot_size);
+		free(io_size);
+		return 1;
+	}
+
+	for (i = 0, j = 0; i != SECTOR_SIZE_BITS; ++i) {
+		const size_t last = j + dl->io_size[i];
+		for (; j != last; ++j)
+			io_size[j] = 1ul << i;
+	}
+	RANDOM_SHUFFLE(io_size, ios, unsigned long);
+
+	for (i = 0, j = 0; i != SECTOR_SIZE_BITS; ++i) {
+		const size_t last = j + dl->merged_size[i];
+		for (; j != last; ++j)
+			spot_size[j] = 1ul << i;
+	}
+	RANDOM_SHUFFLE(spot_size, spots, unsigned long);
+
+	for (i = 0, j = 1; i != SPOT_OFFSET_BITS; ++i) {
+		const size_t last = j + dl->spot_offset[i];
+		for (; j != last; ++j)
+			spot_offset[j] = 1ull << i;
+	}
+	RANDOM_SHUFFLE(spot_offset, spots - 1, unsigned long long);
+
+	#define BYTES(sec) ((sec) * sector_size)
+	offset = first;
+	spot = 0;
+	for (i = 0; i != ios;) {
+		const unsigned long size = spot_size[spot];
+
+		for (j = 0; i != ios && j < size; j += io_size[i], ++i) {
+			const unsigned long long off = BYTES(offset + j);
+			const unsigned long len = BYTES(io_size[i]);
+
+			iocbs[i] = iocb_get(fd, off, len, wr);
+			if (!iocbs[i]) {
+				iocbs_release(iocbs, i);
+				free(spot_offset);
+				free(spot_size);
+				free(io_size);
+				return 1;
+			}
+		}
+
+		if (spots > 1) {
+			offset += size + spot_offset[spot % (spots - 1)];
+			if (offset + spot_size[spot] >= last)
+				offset = first;
+		}
+		spot = (spot + 1) % spots;
+	}
+	#undef BYTES
+
+	free(spot_offset);
+	free(spot_size);
+	free(io_size);
+	return 0;
 }
 
 /**
@@ -392,34 +447,14 @@ static int iocbs_fill(struct iocb **iocbs, int fd,
 {
 	const unsigned long reads = stat->reads;
 	const unsigned long writes = stat->writes;
-	const unsigned long ios = reads + writes;
 
-	const unsigned long sectors = avg_io_sectors(stat);
-	const unsigned long bytes = sectors * sector_size;
-	const unsigned long spot_sectors = avg_spot_sectors(stat);
-	const unsigned long long min_sec = first_sector(stat);
-	const unsigned long long max_sec = last_sector(stat);
+	if (__iocbs_fill(iocbs, fd, 0, &stat->reads_layout))
+		return 1;
 
-	unsigned long i;
+	if (__iocbs_fill(iocbs + reads, fd, 1, &stat->writes_layout))
+		return 1;
 
-	for (i = 0; i != ios;) {
-		const unsigned long long sec = myrandom(min_sec, max_sec);
-		const unsigned long long off = sec * sector_size;
-		unsigned long j;
-
-		for (j = 0; i != ios && j < spot_sectors; j += sectors, ++i) {
-			const unsigned long long offset = off + j * sector_size;
-			const int wr = i < writes;
-
-			iocbs[i] = iocb_get(fd, offset, bytes, wr);
-			if (!iocbs[i]) {
-				iocbs_release(iocbs, i);
-				return 1;
-			}
-		}
-	}
-
-	return iocbs_shuffle(iocbs, ios, stat->inversions);
+	return iocbs_shuffle(iocbs, reads + writes, stat->inversions);
 }
 
 /**
