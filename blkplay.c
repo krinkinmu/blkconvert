@@ -188,6 +188,7 @@ static struct iocb *iocb_get(int fd, unsigned long long off, unsigned long len,
 	} else {
 		io_prep_pread(iocb, fd, buf, len, off);
 	}
+
 	return iocb;
 }
 
@@ -217,7 +218,7 @@ static int iocb_offset_compare(const struct iocb **l, const struct iocb **r)
 /**
  * iocbs_sort - sorts iocbs pointers by offset in ascending order
  */
-static void iocbs_sort(struct iocb **iocbs, size_t size)
+static void iocbs_sort_by_offset(struct iocb **iocbs, size_t size)
 { sort(iocbs, size, &iocb_offset_compare); }
 
 
@@ -295,7 +296,7 @@ static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 		return 1;
 	}
 
-	iocbs_sort(iocbs, size);
+	iocbs_sort_by_offset(iocbs, size);
 	for (i = 0; i != size; ++i) {
 		iocb_ctree_node_init(nodes + i, iocbs[i]);
 		iocb_ctree_append(&tree, nodes + i);
@@ -318,6 +319,65 @@ static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 	return 0;
 }
 
+static unsigned long long first_sector(const struct blkio_stats *stat)
+{
+	unsigned long long sec = ~0ull;
+
+	if (stat->reads)
+		sec = MIN(sec, stat->reads_layout.first_sector);
+	
+	if (stat->writes)
+		sec = MIN(sec, stat->writes_layout.first_sector);
+
+	return sec;
+}
+
+static unsigned long long last_sector(const struct blkio_stats *stat)
+{
+	unsigned long long sec = 0ull;
+
+	if (stat->reads)
+		sec = MAX(sec, stat->reads_layout.last_sector);
+	
+	if (stat->writes)
+		sec = MAX(sec, stat->writes_layout.last_sector);
+
+	return sec;
+}
+
+static unsigned long avg_spot_sectors(const struct blkio_stats *stat)
+{
+	const struct blkio_disk_layout *rdl = &stat->reads_layout;
+	const struct blkio_disk_layout *wdl = &stat->writes_layout;
+	unsigned long total_sectors = 0, count = 0;
+	size_t i;
+
+	for (i = 0; i != SECTOR_SIZE_BITS; ++i) {
+		total_sectors += (1ul << i) * rdl->merged_size[i];
+		count += rdl->merged_size[i];
+		total_sectors += (1ul << i) * wdl->merged_size[i];
+		count += wdl->merged_size[i];
+	}
+
+	return total_sectors / count;
+}
+
+static unsigned long avg_io_sectors(const struct blkio_stats *stat)
+{
+	const struct blkio_disk_layout *rdl = &stat->reads_layout;
+	const struct blkio_disk_layout *wdl = &stat->writes_layout;
+	unsigned long total_sectors = 0, count = 0;
+	size_t i;
+
+	for (i = 0; i != SECTOR_SIZE_BITS; ++i) {
+		total_sectors += (1ul << i) * rdl->io_size[i];
+		count += rdl->io_size[i];
+		total_sectors += (1ul << i) * wdl->io_size[i];
+		count += wdl->io_size[i];
+	}
+	return total_sectors / count;
+}
+
 /**
  * iocbs_fill - genreates iocbs accoriding to stat. Number of
  *              iocbs to generate is stat->reads + stats->writes.
@@ -330,30 +390,28 @@ static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 static int iocbs_fill(struct iocb **iocbs, int fd,
 			const struct blkio_stats *stat)
 {
-	const unsigned long long min_sec = stat->min_sector;
-	const unsigned long long max_sec = stat->max_sector;
-	const unsigned long long spot_sectors = stat->merged_sectors;
-	const unsigned long long spot_bytes = sector_size * spot_sectors;
+	const unsigned long reads = stat->reads;
+	const unsigned long writes = stat->writes;
+	const unsigned long ios = reads + writes;
 
-	const size_t reads = stat->reads;
-	const size_t writes = stat->writes;
-	const size_t ios = reads + writes;
+	const unsigned long sectors = avg_io_sectors(stat);
+	const unsigned long bytes = sectors * sector_size;
+	const unsigned long spot_sectors = avg_spot_sectors(stat);
+	const unsigned long long min_sec = first_sector(stat);
+	const unsigned long long max_sec = last_sector(stat);
 
-	unsigned long long bytes = stat->sectors * sector_size;
-	size_t i;
-
-	if (use_direct_io)
-		bytes = (bytes + sector_size - 1) & ~(sector_size - 1);
+	unsigned long i;
 
 	for (i = 0; i != ios;) {
-		const unsigned long long off = sector_size * myrandom(min_sec,
-					max_sec - spot_sectors);
-		unsigned long long j;
+		const unsigned long long sec = myrandom(min_sec, max_sec);
+		const unsigned long long off = sec * sector_size;
+		unsigned long j;
 
-		for (j = 0; i != ios && j < spot_bytes; j += bytes, ++i) {
+		for (j = 0; i != ios && j < spot_sectors; j += sectors, ++i) {
+			const unsigned long long offset = off + j * sector_size;
 			const int wr = i < writes;
 
-			iocbs[i] = iocb_get(fd, off + j, bytes, wr);
+			iocbs[i] = iocb_get(fd, offset, bytes, wr);
 			if (!iocbs[i]) {
 				iocbs_release(iocbs, i);
 				return 1;
