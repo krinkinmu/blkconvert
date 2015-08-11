@@ -8,7 +8,7 @@ struct list_head {
 	struct list_head *prev;
 };
 
-#define list_entry(ptr, type, field) continer_of(ptr, type, field)
+#define list_entry(ptr, type, field) container_of(ptr, type, field)
 
 static inline void list_init(struct list_head *head)
 { head->next = head->prev = head; }
