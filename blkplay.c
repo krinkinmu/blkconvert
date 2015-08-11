@@ -24,6 +24,7 @@ static const char *input_file_name;
 static const char *device_file_name;
 static unsigned number_of_events = 512u;
 static unsigned sector_size = 512u;
+static unsigned page_size = 4096u;
 static int use_direct_io = 1;
 
 static void show_usage(const char *name)
@@ -176,7 +177,7 @@ static struct iocb *iocb_get(int fd, unsigned long long off, unsigned long len,
 		return 0;
 	}
 
-	if (posix_memalign(&buf, sector_size, len)) {
+	if (posix_memalign(&buf, page_size, len)) {
 		ERR("Cannot allocate buffer for an IO operation\n");
 		iocb_free(iocb);
 		return 0;
