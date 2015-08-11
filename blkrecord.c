@@ -185,15 +185,15 @@ static int blkio_event_read(int fd, struct blkio_event *event)
 	while (to_skip) {
 		char buf[256];
 
-		if (myread(fd, buf, MIN(to_skip, 256)))
+		if (myread(fd, buf, MIN(to_skip, sizeof(buf))))
 			return 1;
-		to_skip -= MIN(to_skip, 256); 
+		to_skip -= MIN(to_skip, sizeof(buf)); 
 	}
 
-	event->time    = trace.time;
-	event->sector  = trace.sector;
+	event->time   = trace.time;
+	event->sector = trace.sector;
 	event->length = (trace.bytes + sector_size - 1) / sector_size;
-	event->action  = trace.action;
+	event->action = trace.action;
 
 	return 0;
 }
