@@ -2,11 +2,11 @@
 
 #include "object_cache.h"
 #include "common.h"
-#include "stack.h"
 #include "debug.h"
+#include "list.h"
 
 struct object_cache {
-	struct stack_head *head;
+	struct list_head head;
 	size_t object_size;
 };
 
@@ -19,15 +19,17 @@ struct object_cache *object_cache_create(size_t object_size)
 		return 0;
 	}
 
-	cache->object_size = MAX(object_size, sizeof(struct stack_head));
-	cache->head = 0;
+	cache->object_size = MAX(object_size, sizeof(struct list_head));
+	list_init(&cache->head);
 	return cache;
 }
 
 void object_cache_destroy(struct object_cache *cache)
 {
-	while (!stack_empty(cache->head)) {
-		struct stack_head *head = stack_pop(&cache->head);
+	while (!list_empty(&cache->head)) {
+		struct list_head *head = cache->head.next;
+
+		list_unlink(head);
 		free(head);
 	}
 	free(cache);
@@ -35,12 +37,14 @@ void object_cache_destroy(struct object_cache *cache)
 
 void *object_cache_alloc(struct object_cache *cache)
 {
-	if (!stack_empty(cache->head))
-		return (void *)stack_pop(&cache->head);
+	if (!list_empty(&cache->head)) {
+		struct list_head *head = cache->head.next;
+
+		list_unlink(head);
+		return (void *)head;
+	}
 	return malloc(cache->object_size);
 }
 
 void object_cache_free(struct object_cache *cache, void *object)
-{
-	stack_push(&cache->head, object);
-}
+{ list_link_after(&cache->head, object); }
