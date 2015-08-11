@@ -499,14 +499,13 @@ static int account_general_stats(struct blkio_stats *stats,
 			begin = MIN(begin, events[i].time);
 			end = MAX(end, events[i].time);
 		} else {
-			if (!iodepth)
-				continue;
-			if (is_queue_event(events + i - 1)) {
+			if (i && is_queue_event(events + i - 1)) {
 				total_iodepth += iodepth;
 				++rw_bursts;
 				++count;
 			}
-			--iodepth;
+			if (iodepth)
+				--iodepth;
 		}
 	}
 
@@ -523,7 +522,7 @@ static int account_general_stats(struct blkio_stats *stats,
 		++count;
 	}
 
-	stats->iodepth = MAX(1, total_iodepth / count);
+	stats->iodepth = MAX(1, (total_iodepth + count - 1) / count);
 	stats->q2q_time = (end - begin) / (reads + writes);
 	stats->reads = reads;
 	stats->writes = writes;
