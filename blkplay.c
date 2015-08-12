@@ -35,7 +35,7 @@ static void show_usage(const char *name)
 		"[-e <number of events> | --events=<number of events>]\n" \
 		"[-s <sector size>      | --sector=<sector size>]\n" \
 		"[-b                    | --buffered]\n" \
-		"\t-d Block device file. No default, must be specified.\n" \
+		"\t-d Block device file. Must be specified.\n" \
 		"\t-f Use specified blkrecord file. Default: stdin\n" \
 		"\t-s Block device sector size. Default: 512\n" \
 		"\t-e Max number of concurrently processing events. Default: 512\n" \
@@ -48,16 +48,16 @@ static int parse_args(int argc, char **argv)
 {
 	static struct option long_opts[] = {
 		{
-			.name = "file",
-			.has_arg = required_argument,
-			.flag = NULL,
-			.val = 'f'
-		},
-		{
 			.name = "device",
 			.has_arg = required_argument,
 			.flag = NULL,
 			.val = 'd'
+		},
+		{
+			.name = "file",
+			.has_arg = required_argument,
+			.flag = NULL,
+			.val = 'f'
 		},
 		{
 			.name = "events",
@@ -73,7 +73,7 @@ static int parse_args(int argc, char **argv)
 		},
 		{
 			.name = "buffered",
-			.has_arg = required_argument,
+			.has_arg = no_argument,
 			.flag = NULL,
 			.val = 'b'
 		},
@@ -81,7 +81,7 @@ static int parse_args(int argc, char **argv)
 			.name = NULL
 		}
 	};
-	static const char *opts = "f:d:e:s:b";
+	static const char *opts = "d:f:e:s:b";
 
 	long i;
 	int c;
