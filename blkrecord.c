@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <byteswap.h>
 
+#include "object_cache.h"
 #include "blktrace_api.h"
 #include "blkrecord.h"
 #include "algorithm.h"
@@ -19,8 +20,8 @@
 
 static const char *input_file_name;
 static const char *output_file_name;
-static unsigned max_time_interval = 1000u;
-static unsigned long max_batch_size = 10000ul;
+static unsigned min_time_interval = 1000u;
+static unsigned long min_batch_size = 10000ul;
 static unsigned sector_size = 512u;
 static int binary = 1;
 
@@ -35,8 +36,8 @@ static void show_usage(const char *name)
 		"[-t                 | --text]\n" \
 		"\t-f Use specified blktrace file. Default: stdin\n" \
 		"\t-o Ouput file. Default: stdout\n" \
-		"\t-i Maximum sampling time interval in ms. Default: 1000\n" \
-		"\t-b Maximum io batch size. Default: 10000\n" \
+		"\t-i Minimum sampling time interval in ms. Default: 1000\n" \
+		"\t-b Minimum io batch size. Default: 10000\n" \
 		"\t-s Sector size. Default: 512\n" \
 		"\t-t Output in text format, by default output is binary.\n";
 
@@ -105,7 +106,7 @@ static int parse_args(int argc, char **argv)
 				ERR("Time interval must be positive\n");
 				return 1;
 			}
-			max_time_interval = i;
+			min_time_interval = i;
 			break;
 		case 'b':
 			i = atol(optarg);
@@ -113,7 +114,7 @@ static int parse_args(int argc, char **argv)
 				ERR("Batch size must be positive\n");
 				return 1;
 			}
-			max_batch_size = i;
+			min_batch_size = i;
 			break;
 		case 's':
 			i = atol(optarg);
@@ -154,13 +155,6 @@ static int blk_io_trace_to_cpu(struct blk_io_trace *trace)
 	return 0;
 }
 
-struct blkio_event {
-	unsigned long long time;
-	unsigned long long sector;
-	unsigned long      length;
-	unsigned long      action;
-};
-
 /**
  * blkio_event_read - reads struct blk_io_trace and converts
  * it to a struct blkio_event.
@@ -190,11 +184,10 @@ static int blkio_event_read(int fd, struct blkio_event *event)
 		to_skip -= MIN(to_skip, sizeof(buf)); 
 	}
 
-	event->time   = trace.time;
+	event->time = trace.time;
 	event->sector = trace.sector;
 	event->length = (trace.bytes + sector_size - 1) / sector_size;
 	event->action = trace.action;
-
 	return 0;
 }
 
@@ -217,40 +210,10 @@ static int is_write_event(const struct blkio_event *event)
 
 static int accept_event(const struct blkio_event *event)
 {
-	/* Drop notify, SCSI and empty events */
-	if (event->action & BLK_TC_ACT(BLK_TC_NOTIFY))
-		return 0;
-
-	if (event->action & BLK_TC_ACT(BLK_TC_PC))
-		return 0;
-
 	if (!event->length)
 		return 0;
 
 	return is_queue_event(event) || is_complete_event(event);
-}
-
-/**
- * blkio_events_read - read up to count interesting events. Event
- *                     is interesting if accept_event returns true.
- *
- * fd - input file descriptor
- * events - array of blkio_event structs
- * count - number of events to read
- *
- * Returns number of read events. If return value less than count
- * than error occured or reached end of file.
- */
-static size_t blkio_events_read(int fd, struct blkio_event *events,
-			size_t count)
-{
-	size_t size = 0;
-
-	while (size != count && !blkio_event_read(fd, events + size)) {
-		if (accept_event(events + size))
-			++size;
-	}
-	return size;
 }
 
 static int blkio_event_time_compare(const struct blkio_event *l,
@@ -287,19 +250,6 @@ static void blkio_events_sort_by_time(struct blkio_event *events, size_t size)
 static void blkio_events_sort_by_offset(struct blkio_event *events, size_t size)
 {
 	sort(events, size, &blkio_event_offset_compare);
-}
-
-/**
- * blkio_events_find - searches first event with time equal or greater
- *                     than time. events array must be sorted by time.
- *                     Returns position of such event in array ot size,
- *                     if no such event found. (a. k. a. lower_bound).
- */
-static size_t blkio_events_find_by_time(const struct blkio_event *events,
-			size_t size, __u64 time)
-{
-	const struct blkio_event key = { .time = time };
-	return lower_bound(events, size, key, &blkio_event_time_compare);
 }
 
 static int blkio_stats_dump(int fd, const struct blkio_stats *stats)
@@ -539,67 +489,230 @@ static int account_events(int fd, const struct blkio_event *events,
 		return 0;
 
 	memset(&stats, 0, sizeof(stats));
-	if (account_disk_layout_stats(&stats, events, size) ||
-			account_general_stats(&stats, events, size))
+
+	if (account_general_stats(&stats, events, size))
+		return 1;
+
+	if (account_disk_layout_stats(&stats, events, size))
 		return 1;
 
 	return blkio_stats_dump(fd, &stats);
 }
 
-static void blkrecord(int ifd, int ofd)
+struct blkio_node {
+	struct rb_node link;
+	struct blkio_event event;
+};
+
+static struct object_cache *blkio_node_cache;
+
+static struct blkio_queue_node *blkio_node_alloc(void)
 {
-	const unsigned long long NS = 1000000ul;
-	const unsigned long long TI = max_time_interval * NS;
-	const unsigned long BS = max_batch_size;
+	struct blkio_queue_node *node = object_cache_alloc(blkio_node_cache);
 
-	size_t size = 0, read = 0;
-	unsigned long long time = 0;
-	struct blkio_event *events = calloc(BS, sizeof(*events));
+	if (!node)
+		return 0;
 
-	if (!events) {
-		ERR("Cannot allocate event buffer\n");
-		return;
+	memset(node, 0, sizeof(*node));
+	return node;
+}
+
+static void blkio_node_free(struct blkio_queue_node *node)
+{
+	object_cache_free(blkio_node_cache, node);
+}
+
+static struct blkio_queue_node *blkio_queue_lower(struct blkio_queue *queue,
+			unsigned long long sector)
+{
+	struct blkio_queue_node *low = 0;
+	struct blkio_queue_node *node;
+	struct rb_node *p = queue->rb_root.rb_node;
+
+	while (p) {
+		node = rb_entry(p, struct blkio_queue_node, rb_node);
+
+		if (node->event.sector < sector) {
+			p = p->rb_right;
+		} else {
+			low = node;
+			p = p->rb_left;
+		}
+	}
+	return low;
+}
+
+static struct blkio_queue_node *blkio_queue_next(struct blkio_queue_node *node)
+{
+	struct rb_node *next = rb_next(&node->rb_node);
+
+	if (!next)
+		return 0;
+
+	return rb_entry(next, struct blkio_queue_node, rb_node);
+}
+
+static void __blkio_queue_insert(struct blkio_queue *queue,
+			struct blkio_queue_node *node)
+{
+	const unsigned long long sector = node->event.sector;
+
+	struct rb_node **p = &queue->rb_root.rb_node;
+	struct rb_node *parent = 0;
+	struct blkio_queue_node *io;
+
+	while (*p) {
+		parent = *p;
+		io = rb_entry(parent, struct blkio_queue_node, rb_node);
+
+		if (sector < io->event.sector)
+			p = &parent->rb_left;
+		else
+			p = &parent->rb_right;
+	}
+	rb_link_node(&node->rb_node, parent, p);
+	rb_insert_color(&node->rb_node, &queue->rb_root);
+	++queue->size;
+}
+
+static int blkio_queue_insert(struct blkio_queue *queue,
+			struct blkio_event *event)
+{
+	unsigned long long from, to;
+	struct blkio_queue_node *pos, *node;
+	struct rb_node *list = 0;
+	int ret = 0;
+
+	if (is_queue_event(event)) {
+		node = blkio_node_alloc();
+		if (!node) {
+			ERR("Cannot allocate blkio_queue_node\n");
+			return 1;
+		}
+		node->event = *event;
+		__blkio_queue_insert(queue, node);
+		return 0;
 	}
 
-	while ((read = blkio_events_read(ifd, events + size, BS - size))) {
-		size_t count;
+	from = event->sector;
+	to = from + event->length;
 
-		size += read;
-		blkio_events_sort_by_time(events, size);
-		count = blkio_events_find_by_time(events, size, time);
-		if (count) {
-			ERR("Discarded %lu unordered requests\n",
-						(unsigned long)count);
-			size -= count;
-			memmove(events, events + count, sizeof(*events) * size);
+	pos = blkio_queue_lower(queue, from);
+	while (pos && pos->event.sector < to) {
+		const unsigned long long begin = pos->event.sector;
+		const unsigned long long end = begin + pos->event.length;
+
+		if (is_complete_event(&pos->event) || to < end) {
+			pos = blkio_queue_next(pos);
 			continue;
 		}
 
-		count = blkio_events_find_by_time(events, size,
-					events[0].time + TI);
-		if (account_events(ofd, events, count)) {
-			free(events);
-			return;
+		node = blkio_node_alloc();
+		if (!node) {
+			ERR("Cannot allocate blkio_queue_node\n");
+			ret = 1;
+			break;
 		}
-		time = events[count - 1].time;
-		size -= count;
-		memmove(events, events + count, sizeof(*events) * size);
+		node->event = *event;
+		node->event.sector = pos->event.sector;
+		node->event.length = pos->event.length;
+		node->rb_node.rb_right = list;
+		list = &node->rb_node;
+		pos = blkio_queue_next(pos);
 	}
 
-
-	while (size) {
-		size_t count;
-
-		count = blkio_events_find_by_time(events, size,
-					events[0].time + TI);
-		if (account_events(ofd, events, count)) {
-			free(events);
-			return;
-		}
-		size -= count;
-		memmove(events, events + count, sizeof(*events) * size);
+	while (list) {
+		node = rb_entry(list, struct blkio_queue_node, rb_node);
+		list = list->rb_right;
+		__blkio_queue_insert(queue, node);
 	}
+	return ret;
+}
+
+static void __blkio_queue_clear(struct rb_node *node)
+{
+	struct blkio_queue_node *io;
+
+	while (node) {
+		io = rb_entry(node, struct blkio_queue_node, rb_node);
+		__blkio_queue_clear(node->rb_right);
+		node = node->rb_left;
+		blkio_node_free(io);
+	}
+}
+
+static void blkio_queue_clear(struct blkio_queue *queue)
+{
+	__blkio_queue_clear(queue->rb_root.rb_node);
+	memset(queue, 0, sizeof(*queue));
+}
+
+static int blkio_queue_handle_events(int fd, struct blkio_queue *queue)
+{
+	struct blkio_queue_node *node;
+	struct rb_node *pos;
+	int ret;
+
+	struct blkio_event *events = calloc(queue->size,
+				sizeof(struct blkio_event));
+	unsigned long size = 0;
+
+	if (!events) {
+		ERR("Cannot allocate array of blkio_event\n");
+		return 1;
+	}
+
+	pos = rb_first(&queue->rb_root);
+	while (pos) {
+		node = rb_entry(pos, struct blkio_queue_node, rb_node);
+		events[size++] = node->event;
+		pos = rb_next(pos);
+	}
+
+	blkio_events_sort_by_time(events, size);
+	ret = account_events(fd, events, size);
+	blkio_queue_clear(queue);
 	free(events);
+	return ret;
+}
+
+static void blkrecord(int ifd, int ofd)
+{
+	const unsigned long long NS = 1000000ull;
+	const unsigned long long TI = NS * min_time_interval;
+	const unsigned long BS = min_batch_size;
+
+	unsigned long long start_time = 0ull;
+	unsigned long long end_time = 0ull;
+
+	struct blkio_queue queue;
+	struct blkio_event event;
+
+	memset(&queue, 0, sizeof(queue));
+
+	while (!blkio_event_read(ifd, &event)) {
+		if (!accept_event(&event))
+			continue;
+
+		if (event.time < start_time) {
+			ERR("Out of order event, skip it\n");
+			continue;
+		}
+
+		if (blkio_queue_insert(&queue, &event))
+			break;
+
+		end_time = MAX(end_time, event.time);
+		if (queue.size < BS && end_time - start_time < TI)
+			continue;
+
+		start_time = end_time;
+		if (blkio_queue_handle_events(ofd, &queue))
+			break;
+	}
+
+	if (queue.size)
+		blkio_queue_handle_events(ofd, &queue);
 }
 
 int main(int argc, char **argv)
@@ -627,7 +740,13 @@ int main(int argc, char **argv)
 		}
 	}
 
-	blkrecord(ifd, ofd);
+	blkio_node_cache = object_cache_create(sizeof(struct blkio_queue_node));
+	if (blkio_node_cache) {
+		blkrecord(ifd, ofd);
+		object_cache_destroy(blkio_node_cache);
+	} else {
+		ERR("Cannot create blkio_queue_node cache\n");
+	}
 
 	close(ofd);
 	close(ifd);
