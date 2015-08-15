@@ -27,8 +27,13 @@ static const char *device_file_name;
 static unsigned number_of_events = 512u;
 static unsigned sector_size = 512u;
 static unsigned page_size = 4096u;
-static long pid = -1;
+static long play_only_pid = -1;
 static int use_direct_io = 1;
+static int time_accurate = 1;
+
+static const unsigned long long NS = 1000000000ull;
+static unsigned long long record_start_time = ~0ull;
+static unsigned long long playing_start_time = ~0ull;
 
 static void show_usage(const char *name)
 {
@@ -127,7 +132,7 @@ static int parse_args(int argc, char **argv)
 				ERR("PID cannot be negative\n");
 				return 1;
 			}
-			pid = i;
+			play_only_pid = i;
 			break;
 		case 'b':
 			use_direct_io = 0;
@@ -151,6 +156,32 @@ static int parse_args(int argc, char **argv)
 	}
 
 	return 0;
+}
+
+static int wait_until(unsigned long long rec_time)
+{
+	unsigned long long curns, play_elapsed, rec_elapsed, to_wait;
+	struct timespec tm;
+
+	if (!time_accurate || rec_time < record_start_time)
+		return 0;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &tm))
+		return 1;
+
+	curns = tm.tv_sec * NS + tm.tv_nsec;
+	if (curns < playing_start_time)
+		return 0;
+
+	play_elapsed = curns - playing_start_time;
+	rec_elapsed = rec_time - record_start_time;
+	if (play_elapsed > rec_elapsed)
+		return 0;
+
+	to_wait = rec_elapsed - play_elapsed;
+	tm.tv_sec = to_wait / NS;
+	tm.tv_nsec = to_wait % NS;
+	return nanosleep(&tm, NULL);
 }
 
 static int blkio_stats_read(int fd, struct blkio_stats *stats)
@@ -576,6 +607,7 @@ static int blkio_stats_play(io_context_t ctx, int fd,
 	}
 
 	reclaim_i = submit_i = 0;
+	wait_until(stat->begin_time);
 	while (reclaim_i != ios) {
 		size_t remain = ios - submit_i;
 		size_t running = submit_i - reclaim_i;
@@ -702,6 +734,12 @@ static void play(void)
 		const unsigned long pid = stat.pid;
 		unsigned long i;
 
+		if (play_only_pid != -1 && pid != (unsigned long)play_only_pid)
+			continue;
+
+		if (stat.begin_time < record_start_time)
+			record_start_time = stat.begin_time;
+
 		for (i = 0; i != size; ++i)
 			if (pids[i] == pid)
 				break;
@@ -735,14 +773,19 @@ static void play(void)
 
 int main(int argc, char **argv)
 {
+	struct timespec tm;
+
 	if (parse_args(argc, argv))
 		return 1;
 
+	if (clock_gettime(CLOCK_MONOTONIC, &tm)) {
+		ERR("Cannot get current time\n");
+		return 1;
+	}
+
+	playing_start_time = tm.tv_sec * NS + tm.tv_nsec;
 	srand(time(NULL));
-	if (pid != -1)
-		play_pid(pid);
-	else
-		play();
+	play();
 
 	return 0;
 }
