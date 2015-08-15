@@ -17,12 +17,14 @@ struct blkio_disk_layout {
 };
 
 struct blkio_stats {
-	__u64 q2q_time;
+	__u64 begin_time;
+	__u64 end_time;
 	__u64 inversions;
 	__u32 reads;
 	__u32 writes;
 	__u32 iodepth;
 	__u32 batch;
+	__u32 pid;
 	struct blkio_disk_layout reads_layout;
 	struct blkio_disk_layout writes_layout;
 };
@@ -32,6 +34,7 @@ struct blkio_event {
 	unsigned long long sector;
 	unsigned long length;
 	unsigned long action;
+	unsigned long pid;
 };
 
 struct blkio_queue_node {

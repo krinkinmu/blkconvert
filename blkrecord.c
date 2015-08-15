@@ -20,10 +20,11 @@
 
 static const char *input_file_name;
 static const char *output_file_name;
-static unsigned min_time_interval = 1000u;
+static unsigned min_time_interval = 5000u;
 static unsigned long min_batch_size = 10000ul;
 static unsigned sector_size = 512u;
 static int binary = 1;
+static int per_process = 0;
 
 static void show_usage(const char *name)
 {
@@ -34,12 +35,14 @@ static void show_usage(const char *name)
 		"[-b <batch size>    | --batch=<batch size>]\n" \
 		"[-s <sector size>   | --sector=<sector size>]\n" \
 		"[-t                 | --text]\n" \
+		"[-p                 | --per-process]\n" \
 		"\t-f Use specified blktrace file. Default: stdin\n" \
 		"\t-o Ouput file. Default: stdout\n" \
-		"\t-i Minimum sampling time interval in ms. Default: 1000\n" \
+		"\t-i Minimum sampling time interval in ms. Default: 5000\n" \
 		"\t-b Minimum io batch size. Default: 10000\n" \
 		"\t-s Sector size. Default: 512\n" \
-		"\t-t Output in text format, by default output is binary.\n";
+		"\t-t Output in text format, by default output is binary.\n" \
+		"\t-p Use per process stats.\n";
 
 	ERR("Usage: %s %s", name, usage);		
 }
@@ -84,10 +87,16 @@ static int parse_args(int argc, char **argv)
 			.val = 't'
 		},
 		{
+			.name = "per-process",
+			.has_arg = no_argument,
+			.flag = NULL,
+			.val = 'p'
+		},
+		{
 			.name = NULL
 		}
 	};
-	static const char *opts = "f:o:i:b:s:t";
+	static const char *opts = "f:o:i:b:s:tp";
 
 	long i;
 	int c;
@@ -127,6 +136,9 @@ static int parse_args(int argc, char **argv)
 		case 't':
 			binary = 0;
 			break;
+		case 'p':
+			per_process = 1;
+			break;
 		default:
 			show_usage(argv[0]);
 			return 1;
@@ -146,11 +158,12 @@ static int blk_io_trace_to_cpu(struct blk_io_trace *trace)
 		return 1;
 	}
 
-	trace->time    = __bswap_64(trace->time);
-	trace->sector  = __bswap_64(trace->sector);
-	trace->bytes   = __bswap_32(trace->bytes);
-	trace->action  = __bswap_32(trace->action);
+	trace->time = __bswap_64(trace->time);
+	trace->sector = __bswap_64(trace->sector);
+	trace->bytes = __bswap_32(trace->bytes);
+	trace->action = __bswap_32(trace->action);
 	trace->pdu_len = __bswap_16(trace->pdu_len);
+	trace->pid = __bswap_32(trace->pid);
 	/* Other fields aren't interesting so far */
 	return 0;
 }
@@ -188,6 +201,7 @@ static int blkio_event_read(int fd, struct blkio_event *event)
 	event->sector = trace.sector;
 	event->length = (trace.bytes + sector_size - 1) / sector_size;
 	event->action = trace.action;
+	event->pid = per_process ? trace.pid : 0;
 	return 0;
 }
 
@@ -236,12 +250,23 @@ static int blkio_event_offset_compare(const struct blkio_event *l,
 	return 0;
 }
 
-/**
- * blkio_events_sort_by_time - sorts events by time in ascending order
- */
-static void blkio_events_sort_by_time(struct blkio_event *events, size_t size)
+static int blkio_event_pid_compare(const struct blkio_event *l,
+			const struct blkio_event *r)
 {
-	sort(events, size, &blkio_event_time_compare);
+	if (l->pid < r->pid)
+		return -1;
+	if (l->pid > r->pid)
+		return 1;
+	return 0;
+}
+
+static int blkio_event_pid_time_compare(const struct blkio_event *l,
+			const struct blkio_event *r)
+{
+	const int ret = blkio_event_pid_compare(l, r);
+	if (ret)
+		return ret;
+	return blkio_event_time_compare(l, r);
 }
 
 /**
@@ -250,6 +275,16 @@ static void blkio_events_sort_by_time(struct blkio_event *events, size_t size)
 static void blkio_events_sort_by_offset(struct blkio_event *events, size_t size)
 {
 	sort(events, size, &blkio_event_offset_compare);
+}
+
+/**
+ * blkio_events_sort_by_pid_and_time - sort events by pair (pid, time) in
+ *                                     ascending order.
+ */
+static void blkio_events_sort_by_pid_time(struct blkio_event *events,
+			size_t size)
+{
+	sort(events, size, &blkio_event_pid_time_compare);
 }
 
 static int blkio_stats_dump(int fd, const struct blkio_stats *stats)
@@ -273,10 +308,13 @@ static int blkio_stats_dump(int fd, const struct blkio_stats *stats)
 		last = MAX(last, stats->writes_layout.last_sector);
 	}
 
-	snprintf(buffer, 512, "q2q=%llu inversions=%llu reads=%lu writes=%lu "
+	snprintf(buffer, 512, "pid=%lu begin=%llu end=%llu "
+				"inversions=%llu reads=%lu writes=%lu "
 				"avg_iodepth=%lu avg_batch=%lu "
 				"first_sec=%llu last_sec=%llu\n",
-				(unsigned long long)stats->q2q_time,
+				(unsigned long)stats->pid,
+				(unsigned long long)stats->begin_time,
+				(unsigned long long)stats->end_time,
 				(unsigned long long)stats->inversions,
 				(unsigned long)stats->reads,
 				(unsigned long)stats->writes,
@@ -473,7 +511,8 @@ static int account_general_stats(struct blkio_stats *stats,
 	}
 
 	stats->iodepth = MAX(1, (total_iodepth + count - 1) / count);
-	stats->q2q_time = (end - begin) / (reads + writes);
+	stats->begin_time = begin;
+	stats->end_time = end;
 	stats->reads = reads;
 	stats->writes = writes;
 
@@ -489,6 +528,7 @@ static int account_events(int fd, const struct blkio_event *events,
 		return 0;
 
 	memset(&stats, 0, sizeof(stats));
+	stats.pid = events->pid;
 
 	if (account_general_stats(&stats, events, size))
 		return 1;
@@ -581,7 +621,7 @@ static int blkio_queue_insert(struct blkio_queue *queue,
 	unsigned long long from, to;
 	struct blkio_queue_node *pos, *node;
 	struct rb_node *list = 0;
-	int ret = 0;
+	int ret = 0, write;
 
 	if (is_queue_event(event)) {
 		node = blkio_node_alloc();
@@ -596,16 +636,17 @@ static int blkio_queue_insert(struct blkio_queue *queue,
 
 	from = event->sector;
 	to = from + event->length;
+	write = is_write_event(event);
 
 	pos = blkio_queue_lower(queue, from);
-	while (pos && pos->event.sector < to) {
+	for (; pos && pos->event.sector < to; pos = blkio_queue_next(pos)) {
 		const unsigned long long begin = pos->event.sector;
 		const unsigned long long end = begin + pos->event.length;
 
-		if (is_complete_event(&pos->event) || to < end) {
-			pos = blkio_queue_next(pos);
+		if (to < end
+				|| is_complete_event(&pos->event)
+				|| is_write_event(&pos->event) != write)
 			continue;
-		}
 
 		node = blkio_node_alloc();
 		if (!node) {
@@ -614,11 +655,11 @@ static int blkio_queue_insert(struct blkio_queue *queue,
 			break;
 		}
 		node->event = *event;
+		node->event.pid = pos->event.pid;
 		node->event.sector = pos->event.sector;
 		node->event.length = pos->event.length;
 		node->rb_node.rb_right = list;
 		list = &node->rb_node;
-		pos = blkio_queue_next(pos);
 	}
 
 	while (list) {
@@ -651,11 +692,11 @@ static int blkio_queue_handle_events(int fd, struct blkio_queue *queue)
 {
 	struct blkio_queue_node *node;
 	struct rb_node *pos;
-	int ret;
+	int ret = 0;
 
 	struct blkio_event *events = calloc(queue->size,
 				sizeof(struct blkio_event));
-	unsigned long size = 0;
+	unsigned long size = 0, i, min_i;
 
 	if (!events) {
 		ERR("Cannot allocate array of blkio_event\n");
@@ -668,10 +709,41 @@ static int blkio_queue_handle_events(int fd, struct blkio_queue *queue)
 		events[size++] = node->event;
 		pos = rb_next(pos);
 	}
-
-	blkio_events_sort_by_time(events, size);
-	ret = account_events(fd, events, size);
 	blkio_queue_clear(queue);
+
+	/**
+	 * Things a bit complicated when we take time into account, we want
+	 * PID with minimum start time goes first, so we find it first, and
+	 * then dump stats in two steps: starting from min PID and then from
+	 * first PID in the array.
+	 */
+	blkio_events_sort_by_pid_time(events, size);
+	min_i = 0;
+	for (i = 0; !ret && i != size; ) {
+		const unsigned long pid = events[i].pid;
+		const unsigned long j = i;
+
+		for (; i != size && events[i].pid == pid; ++i);
+		if (events[j].time < events[min_i].time)
+			min_i = j;
+	}
+
+	for (i = min_i; !ret && i != size; ) {
+		const unsigned long pid = events[i].pid;
+		const unsigned long j = i;
+
+		for (; i != size && events[i].pid == pid; ++i);
+		ret = account_events(fd, events + j, i - j);
+	}
+
+	for (i = 0; !ret && i != min_i; ) {
+		const unsigned long pid = events[i].pid;
+		const unsigned long j = i;
+
+		for (; i != size && events[i].pid == pid; ++i);
+		ret = account_events(fd, events + j, i - j);
+	}
+
 	free(events);
 	return ret;
 }
