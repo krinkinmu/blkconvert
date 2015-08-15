@@ -3,12 +3,14 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <errno.h>
 #include <time.h>
 
 #include <libaio.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -25,20 +27,23 @@ static const char *device_file_name;
 static unsigned number_of_events = 512u;
 static unsigned sector_size = 512u;
 static unsigned page_size = 4096u;
+static long pid = -1;
 static int use_direct_io = 1;
 
 static void show_usage(const char *name)
 {
 	static const char *usage = "\n\n" \
 		" -d <device>           | --device=<device>\n" \
-		"[-f <input file>       | --file=<input file>]\n" \
+		" -f <input file>       | --file=<input file>\n" \
 		"[-e <number of events> | --events=<number of events>]\n" \
 		"[-s <sector size>      | --sector=<sector size>]\n" \
+		"[-p <pid>              | --pid=<pid>]\n" \
 		"[-b                    | --buffered]\n" \
 		"\t-d Block device file. Must be specified.\n" \
 		"\t-f Use specified blkrecord file. Default: stdin\n" \
-		"\t-s Block device sector size. Default: 512\n" \
 		"\t-e Max number of concurrently processing events. Default: 512\n" \
+		"\t-s Block device sector size. Default: 512\n" \
+		"\t-p Process PID to play.\n" \
 		"\t-b Use buffered IO (do not use direct IO)\n";
 
 	ERR("Usage: %s %s", name, usage);
@@ -72,6 +77,12 @@ static int parse_args(int argc, char **argv)
 			.val = 's'
 		},
 		{
+			.name = "pid",
+			.has_arg = required_argument,
+			.flag = NULL,
+			.val = 'p'
+		},
+		{
 			.name = "buffered",
 			.has_arg = no_argument,
 			.flag = NULL,
@@ -81,7 +92,7 @@ static int parse_args(int argc, char **argv)
 			.name = NULL
 		}
 	};
-	static const char *opts = "d:f:e:s:b";
+	static const char *opts = "d:f:e:s:p:b";
 
 	long i;
 	int c;
@@ -110,6 +121,14 @@ static int parse_args(int argc, char **argv)
 			}
 			sector_size = (unsigned)i;
 			break;
+		case 'p':
+			i = atol(optarg);
+			if (i < 0) {
+				ERR("PID cannot be negative\n");
+				return 1;
+			}
+			pid = i;
+			break;
 		case 'b':
 			use_direct_io = 0;
 			break;
@@ -117,6 +136,12 @@ static int parse_args(int argc, char **argv)
 			show_usage(argv[0]);
 			return 1;
 		}
+	}
+
+	if (!input_file_name) {
+		ERR("Spcify input file name\n");
+		show_usage(argv[0]);
+		return 1;
 	}
 
 	if (!device_file_name) {
@@ -589,59 +614,135 @@ static int blkio_stats_play(io_context_t ctx, int fd,
 	return rc;
 }
 
-static void play(int ifd, int dfd)
+static int open_input_file(void)
+{
+	int fd = open(input_file_name, 0);
+
+	if (fd < 0)
+		perror("Cannot open input file");
+		
+	return fd;
+}
+
+static int open_disk_file(void)
+{	
+	int flags = O_RDWR;
+	int fd;
+
+	if (use_direct_io)
+		flags |= O_DIRECT;
+
+	fd = open(device_file_name, flags);
+	if (fd < 0)
+		perror("Cannot open block device file");
+
+	return fd;
+}
+
+static void play_pid(unsigned long pid)
 {
 	struct blkio_stats stat;
 	io_context_t ctx = 0;
+	int ifd, dfd;
 	int ret;
 
+	ifd = open_input_file();
+	if (ifd < 0)
+		return;
+
+	dfd = open_disk_file();
+	if (dfd < 0) {
+		close(ifd);
+		return;
+	}
+
 	iocb_cache = object_cache_create(sizeof(struct iocb));
+	if (!iocb_cache) {
+		ERR("Cannot create iocb cache\n");
+		close(dfd);
+		close(ifd);
+		return;
+	}
 
 	if ((ret = io_setup(number_of_events, &ctx))) {
 		ERR("Cannot initialize AIO context (%d)\n", -ret);
 		object_cache_destroy(iocb_cache);
+		close(dfd);
+		close(ifd);
 		return;
 	}
 
 	while (!blkio_stats_read(ifd, &stat)) {
+		if (stat.pid != pid)
+			continue;
+
 		if (blkio_stats_play(ctx, dfd, &stat))
 			break;
 	}
 
 	io_destroy(ctx);
 	object_cache_destroy(iocb_cache);
+	close(dfd);
+	close(ifd);
+}
+
+static void play(void)
+{
+	#define MAX_PIDS 4096
+	unsigned long pids[MAX_PIDS];
+	unsigned long size = 0;
+	struct blkio_stats stat;
+	int fd;
+
+	fd = open_input_file();
+	if (fd < 0)
+		return;
+
+	while (!blkio_stats_read(fd, &stat)) {
+		const unsigned long pid = stat.pid;
+		unsigned long i;
+
+		for (i = 0; i != size; ++i)
+			if (pids[i] == pid)
+				break;
+
+		if (i == size) {
+			pid_t child;
+			pids[size++] = pid;
+
+			child = fork();
+			if (child < 0) {
+				ERR("Cannot create child process\n");
+				break;
+			}
+
+			if (child == 0) {
+				close(fd);
+				play_pid(pid);
+				return;
+			}
+		}
+	}
+	close(fd);
+
+	while (size--) {
+		errno = 0;
+		if (wait(NULL) == -1 && errno == ECHILD)
+			break;
+	}
+	#undef MAX_PIDS
 }
 
 int main(int argc, char **argv)
 {
-	int ifd = 0, dfd = 1;
-	int flags = O_RDWR;
-
 	if (parse_args(argc, argv))
 		return 1;
 
-	if (input_file_name && strcmp("-", input_file_name)) {
-		ifd = open(input_file_name, 0);
-		if (ifd < 0) {
-			perror("Cannot open input file");
-			return 1;
-		}
-	}
-
-	if (use_direct_io)
-		flags |= O_DIRECT;
-	dfd = open(device_file_name, flags);
-	if (dfd < 0) {
-		close(ifd);
-		perror("Cannot open block device file");
-		return 1;
-	}
-
 	srand(time(NULL));
-	play(ifd, dfd);
-
-	close(dfd);
-	close(ifd);
+	if (pid != -1)
+		play_pid(pid);
+	else
+		play();
 
 	return 0;
 }
