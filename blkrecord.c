@@ -472,7 +472,7 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 static int account_general_stats(struct blkio_stats *stats,
 			const struct blkio_event *events, size_t size)
 {
-	unsigned long total_iodepth = 0, iodepth = 0, count = 0;
+	unsigned long total_iodepth = 0, iodepth = 0;
 	unsigned long long begin = ~0ull, end = 0;
 	unsigned long reads = 0, writes = 0, rw_bursts = 0;
 	size_t i;
@@ -490,7 +490,6 @@ static int account_general_stats(struct blkio_stats *stats,
 			if (i && is_queue_event(events + i - 1)) {
 				total_iodepth += iodepth;
 				++rw_bursts;
-				++count;
 			}
 			if (iodepth)
 				--iodepth;
@@ -500,17 +499,13 @@ static int account_general_stats(struct blkio_stats *stats,
 	if (reads + writes == 0)
 		return 0;
 
-	if (is_queue_event(events + size - 1))
-		++rw_bursts;
-
-	stats->batch = (reads + writes + rw_bursts - 1) / rw_bursts;
-
-	if (iodepth) {
+	if (is_queue_event(events + i - 1)) {
 		total_iodepth += iodepth;
-		++count;
+		++rw_bursts;
 	}
 
-	stats->iodepth = MAX(1, (total_iodepth + count - 1) / count);
+	stats->batch = (reads + writes + rw_bursts - 1) / rw_bursts;
+	stats->iodepth = MAX(1, (total_iodepth + rw_bursts - 1) / rw_bursts);
 	stats->begin_time = begin;
 	stats->end_time = end;
 	stats->reads = reads;
