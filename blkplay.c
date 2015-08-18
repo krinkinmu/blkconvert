@@ -490,9 +490,10 @@ static int iocbs_fill(struct iocb **iocbs, int fd,
  * iocbs - array of at least count iocbs
  * count - number of IOs to submit
  *
- * Returns 0, if success.
+ * Returns number of submitted IOs, if returned value less then count,
+ * then error occured.
  */
-static int iocbs_submit(io_context_t ctx, struct iocb **iocbs, size_t count)
+static size_t iocbs_submit(io_context_t ctx, struct iocb **iocbs, size_t count)
 {
 	size_t sb = 0;
 
@@ -501,25 +502,27 @@ static int iocbs_submit(io_context_t ctx, struct iocb **iocbs, size_t count)
 
 		if (ret < 0) {
 			ERR("Error %d, while submiting IO\n", -ret);
-			return 1;
+			return sb;
 		}
 		sb += ret;
 	}
-	return 0;
+	return sb;
 }
 
 /**
- * io_events_check - check events array filled with io_getevents. If at least
- *                   one of io_event reports error function print detailed info
- *                   to stderr and returns 1.
+ * io_events_check_and_release - check events array filled with io_getevents.
+ *                               If at least one of io_event reports error
+ *                               function print detailed info to stderr and
+ *                               returns 1. Also releases all iocbs.
  */
-static int io_events_check(const struct io_event *events, size_t count)
+static int io_events_check_and_release(struct io_event *events, size_t count)
 {
 	size_t i;
+	int ret = 0;
 
 	for (i = 0; i != count; ++i) {
-		const struct io_event * const e = events + i;
-		const struct iocb * const iocb = e->obj;
+		struct io_event *e = events + i;
+		struct iocb *iocb = e->obj;
 
 		if (e->res != iocb->u.c.nbytes) {
 			const char *op = iocb->aio_lio_opcode == IO_CMD_PREAD
@@ -530,10 +533,64 @@ static int io_events_check(const struct io_event *events, size_t count)
 						iocb->u.c.offset,
 						e->res,
 						e->res2);
-			return 1;
+			ret = 1;
 		}
+		iocb_release(iocb);
 	}
-	return 0;
+	return ret;
+}
+
+struct process_context {
+	io_context_t io_ctx;
+	struct io_event *events;
+	long size, running;
+};
+
+static struct process_context *process_context_create(void)
+{
+	struct process_context *ctx = malloc(sizeof(struct process_context));
+	int ret;
+
+	if (!ctx) {
+		ERR("Cannot allocate process_context\n");
+		return 0;
+	}
+
+	ctx->io_ctx = 0;
+	ctx->size = number_of_events;
+	ctx->running = 0;
+	ctx->events = calloc(number_of_events, sizeof(struct io_event));
+	if (!ctx->events) {
+		ERR("Cannot allocate array of io_event\n");
+		free(ctx);
+		return 0;
+	}
+
+	if ((ret = io_setup(number_of_events, &ctx->io_ctx))) {
+		ERR("Cannot initialize AIO context (%d)\n", -ret);
+		free(ctx->events);
+		free(ctx);
+		return 0;
+	}
+
+	return ctx;
+}
+
+static void process_context_destroy(struct process_context *ctx)
+{
+	if (ctx->running) {
+		const int ret = io_getevents(ctx->io_ctx, ctx->running,
+					ctx->size, ctx->events, NULL);
+
+		if (ret < 0)
+			ERR("Error %d, while reclaiming IO\n", -ret);
+		else
+			io_events_check_and_release(ctx->events, ret);
+	}
+
+	io_destroy(ctx->io_ctx);
+	free(ctx->events);
+	free(ctx);
 }
 
 /**
@@ -545,15 +602,15 @@ static int io_events_check(const struct io_event *events, size_t count)
  *
  * Returns 0, if success.
  */
-static int blkio_stats_play(io_context_t ctx, int fd,
+static int blkio_stats_play(struct process_context *ctx, int fd,
 			const struct blkio_stats *stat)
 {
-	const size_t ios = stat->reads + stat->writes;
-	const size_t iodepth = MIN(stat->iodepth, number_of_events);
-	const size_t batch = stat->batch;
+	const long ios = stat->reads + stat->writes;
+	const long iodepth = MIN(stat->iodepth, ctx->size);
+	const long batch = MIN(iodepth, stat->batch);
+
 	struct iocb **iocbs;
-	struct io_event *events;
-	size_t submit_i, reclaim_i;
+	long submit_i;
 	int rc = 0;
 
 	iocbs = calloc(ios, sizeof(struct iocb *));
@@ -562,55 +619,49 @@ static int blkio_stats_play(io_context_t ctx, int fd,
 		return 1;
 	}
 
-	events = calloc(iodepth, sizeof(struct io_event));
-	if (!events) {
-		free(iocbs);
-		ERR("Cannot allocate array of struct io_event\n");
-		return 1;
-	}
-
 	if (iocbs_fill(iocbs, fd, stat)) {
 		free(iocbs);
-		free(events);
 		return 1;
 	}
 
-	reclaim_i = submit_i = 0;
-	while (reclaim_i != ios) {
-		size_t remain = ios - submit_i;
-		size_t running = submit_i - reclaim_i;
-		size_t todo = MIN(iodepth - running, remain);
-		int ret;
+	submit_i = 0;
+	while (submit_i != ios) {
+		long submit = 0, reclaim = 1;
+		long next, submitted, reclaimed;
 
-		if (iocbs_submit(ctx, iocbs + submit_i, todo)) {
+		if (ctx->running < iodepth)
+			submit = MIN(ios - submit_i, iodepth - ctx->running);
+
+		submitted = iocbs_submit(ctx->io_ctx, iocbs + submit_i, submit);
+		submit_i += submitted;
+		ctx->running += submitted;
+
+		if (submitted < submit) {
 			rc = 1;
 			break;
 		}
-		submit_i += todo;
 
-		running = submit_i - reclaim_i;
-		remain = ios - submit_i;
-		todo = 1;
-		if (iodepth - running < batch)
-			todo = MIN(running, batch - (iodepth - running));
+		next = MIN(ios - submit_i, batch);
+		if (ctx->running > iodepth - next)
+			reclaim = ctx->running - iodepth + next;
 
-		ret = io_getevents(ctx, todo, iodepth, events, NULL);
-		if (ret < 0) {
-			ERR("Error %d, while reclaiming IO\n", -ret);
+		reclaimed = io_getevents(ctx->io_ctx, reclaim, ctx->size,
+					ctx->events, NULL);
+		if (reclaimed < 0) {
+			ERR("Error %ld, while reclaiming IO\n", -reclaimed);
 			rc = 1;
 			break;
 		}
-		reclaim_i += ret;
+		ctx->running -= reclaimed;
 
-		if (io_events_check(events, ret)) {
+		if (io_events_check_and_release(ctx->events, reclaimed)) {
 			rc = 1;
 			break;
 		}
 	}
 
-	iocbs_release(iocbs, ios);
+	iocbs_release(iocbs + submit_i, ios - submit_i);
 	free(iocbs);
-	free(events);
 	return rc;
 }
 
@@ -641,10 +692,9 @@ static int open_disk_file(void)
 
 static void play_pid(unsigned long pid)
 {
+	struct process_context *ctx;
 	struct blkio_stats stat;
-	io_context_t ctx = 0;
 	int ifd, dfd;
-	int ret;
 
 	ifd = open_input_file();
 	if (ifd < 0)
@@ -664,8 +714,9 @@ static void play_pid(unsigned long pid)
 		return;
 	}
 
-	if ((ret = io_setup(number_of_events, &ctx))) {
-		ERR("Cannot initialize AIO context (%d)\n", -ret);
+	ctx = process_context_create();
+	if (!ctx) {
+		ERR("Cannot create process_context\n");
 		object_cache_destroy(iocb_cache);
 		close(dfd);
 		close(ifd);
@@ -680,7 +731,7 @@ static void play_pid(unsigned long pid)
 			break;
 	}
 
-	io_destroy(ctx);
+	process_context_destroy(ctx);
 	object_cache_destroy(iocb_cache);
 	close(dfd);
 	close(ifd);
