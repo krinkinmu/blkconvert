@@ -27,8 +27,17 @@ static const char *device_file_name;
 static unsigned number_of_events = 512u;
 static unsigned sector_size = 512u;
 static unsigned page_size = 4096u;
-static long pid = -1;
 static int use_direct_io = 1;
+
+struct play_process {
+	unsigned long pid;
+	unsigned long rpid;
+	int fd;
+};
+
+#define MAX_PIDS_SIZE 1024
+static struct play_process pids_to_play[MAX_PIDS_SIZE];
+static unsigned pids_to_play_size;
 
 static void show_usage(const char *name)
 {
@@ -94,8 +103,9 @@ static int parse_args(int argc, char **argv)
 	};
 	static const char *opts = "d:f:e:s:p:b";
 
+	unsigned j;
 	long i;
-	int c;
+	int c, found;
 
 	while ((c = getopt_long(argc, argv, opts, long_opts, NULL)) >= 0) {
 		switch (c) {
@@ -127,7 +137,17 @@ static int parse_args(int argc, char **argv)
 				ERR("PID cannot be negative\n");
 				return 1;
 			}
-			pid = i;
+
+			found = 0;
+			for (j = 0; j != pids_to_play_size; ++j) {
+				if (pids_to_play[j].pid == (unsigned long)i) {
+					found = 1;
+					break;
+				}
+			}
+
+			if (!found)
+				pids_to_play[pids_to_play_size++].pid = i;
 			break;
 		case 'b':
 			use_direct_io = 0;
@@ -150,11 +170,16 @@ static int parse_args(int argc, char **argv)
 		return 1;
 	}
 
+	
+
 	return 0;
 }
 
 static int blkio_stats_read(int fd, struct blkio_stats *stats)
 { return myread(fd, (char *)stats, sizeof(*stats)); }
+
+static int blkio_stats_write(int fd, const struct blkio_stats *stats)
+{ return mywrite(fd, (char *)stats, sizeof(*stats)); }
 
 static unsigned mylog2(unsigned long long x)
 {
@@ -176,59 +201,66 @@ static unsigned long long myrandom(unsigned long long from,
 	return value % (to - from) + from;
 }
 
+struct process_context {
+	io_context_t io_ctx;
+	struct io_event *events;
+	long size, running;
+	int fd;
+	struct object_cache *cache;
+};
+
 /**
  * struct iocb management routines (cached allocation and release mostly).
  */
-static struct object_cache *iocb_cache;
-
-static struct iocb *iocb_alloc(void)
+static struct iocb *iocb_alloc(struct object_cache *cache)
 {
-	return object_cache_alloc(iocb_cache);
+	return object_cache_alloc(cache);
 }
 
-static void iocb_free(struct iocb *iocb)
+static void iocb_free(struct object_cache *cache, struct iocb *iocb)
 {
-	object_cache_free(iocb_cache, iocb);
+	object_cache_free(cache, iocb);
 }
 
-static struct iocb *iocb_get(int fd, unsigned long long off, unsigned long len,
-			int rw)
+static struct iocb *iocb_get(struct process_context *ctx,
+			unsigned long long off, unsigned long len, int rw)
 {
 	struct iocb *iocb;
 	void *buf;
 
-	if (!(iocb = iocb_alloc())) {
+	if (!(iocb = iocb_alloc(ctx->cache))) {
 		ERR("Cannot allocate iocb\n");
 		return 0;
 	}
 
 	if (posix_memalign(&buf, page_size, len)) {
 		ERR("Cannot allocate buffer for an IO operation\n");
-		iocb_free(iocb);
+		iocb_free(ctx->cache, iocb);
 		return 0;
 	}
 
 	if (rw) {
-		io_prep_pwrite(iocb, fd, buf, len, off);
+		io_prep_pwrite(iocb, ctx->fd, buf, len, off);
 		memset(buf, 0x13, len);
 	} else {
-		io_prep_pread(iocb, fd, buf, len, off);
+		io_prep_pread(iocb, ctx->fd, buf, len, off);
 	}
 
 	return iocb;
 }
 
-static void iocb_release(struct iocb *iocb)
+static void iocb_release(struct process_context *ctx, struct iocb *iocb)
 {
 	free(iocb->u.c.buf);
-	iocb_free(iocb);
+	iocb_free(ctx->cache, iocb);
 }
 
-static void iocbs_release(struct iocb **iocbs, size_t count)
+static void iocbs_release(struct process_context *ctx, struct iocb **iocbs,
+			size_t count)
 {
 	size_t i;
 	for (i = 0; i != count; ++i)
-		iocb_release(iocbs[i]);
+		iocb_release(ctx, iocbs[i]);
 }
 
 
@@ -360,8 +392,8 @@ static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 		} \
 	} while (0)
 
-static int __iocbs_fill(struct iocb **iocbs, int fd, int wr,
-			const struct blkio_disk_layout *dl)
+static int __iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
+			int wr, const struct blkio_disk_layout *dl)
 {
 	const unsigned long long first = dl->first_sector;
 	const unsigned long long last = dl->last_sector;
@@ -434,9 +466,9 @@ static int __iocbs_fill(struct iocb **iocbs, int fd, int wr,
 			const unsigned long long off = BYTES(offset + j);
 			const unsigned long len = BYTES(io_size[i]);
 
-			iocbs[i] = iocb_get(fd, off, len, wr);
+			iocbs[i] = iocb_get(ctx, off, len, wr);
 			if (!iocbs[i]) {
-				iocbs_release(iocbs, i);
+				iocbs_release(ctx, iocbs, i);
 				free(spot_offset);
 				free(spot_size);
 				free(io_size);
@@ -468,16 +500,16 @@ static int __iocbs_fill(struct iocb **iocbs, int fd, int wr,
  * fd - file descriptor to work with
  * stat - IO parameters.
  */
-static int iocbs_fill(struct iocb **iocbs, int fd,
+static int iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
 			const struct blkio_stats *stat)
 {
 	const unsigned long reads = stat->reads;
 	const unsigned long writes = stat->writes;
 
-	if (__iocbs_fill(iocbs, fd, 0, &stat->reads_layout))
+	if (__iocbs_fill(iocbs, ctx, 0, &stat->reads_layout))
 		return 1;
 
-	if (__iocbs_fill(iocbs + reads, fd, 1, &stat->writes_layout))
+	if (__iocbs_fill(iocbs + reads, ctx, 1, &stat->writes_layout))
 		return 1;
 
 	return iocbs_shuffle(iocbs, reads + writes, stat->inversions);
@@ -486,19 +518,20 @@ static int iocbs_fill(struct iocb **iocbs, int fd,
 /**
  * iocbs_submit - submits exactly count IOs from iocbs array.
  *
- * ctx - aio context
+ * ctx - initialized process_context
  * iocbs - array of at least count iocbs
  * count - number of IOs to submit
  *
  * Returns number of submitted IOs, if returned value less then count,
  * then error occured.
  */
-static size_t iocbs_submit(io_context_t ctx, struct iocb **iocbs, size_t count)
+static size_t iocbs_submit(struct process_context *ctx, struct iocb **iocbs,
+			size_t count)
 {
 	size_t sb = 0;
 
 	while (sb != count) {
-		const int ret = io_submit(ctx, count - sb, iocbs + sb);
+		const int ret = io_submit(ctx->io_ctx, count - sb, iocbs + sb);
 
 		if (ret < 0) {
 			ERR("Error %d, while submiting IO\n", -ret);
@@ -515,13 +548,14 @@ static size_t iocbs_submit(io_context_t ctx, struct iocb **iocbs, size_t count)
  *                               function print detailed info to stderr and
  *                               returns 1. Also releases all iocbs.
  */
-static int io_events_check_and_release(struct io_event *events, size_t count)
+static int io_events_check_and_release(struct process_context *ctx,
+			size_t count)
 {
 	size_t i;
 	int ret = 0;
 
 	for (i = 0; i != count; ++i) {
-		struct io_event *e = events + i;
+		struct io_event *e = ctx->events + i;
 		struct iocb *iocb = e->obj;
 
 		if (e->res != iocb->u.c.nbytes) {
@@ -535,45 +569,62 @@ static int io_events_check_and_release(struct io_event *events, size_t count)
 						e->res2);
 			ret = 1;
 		}
-		iocb_release(iocb);
+		iocb_release(ctx, iocb);
 	}
 	return ret;
 }
 
-struct process_context {
-	io_context_t io_ctx;
-	struct io_event *events;
-	long size, running;
-};
+static int open_disk_file(void)
+{	
+	int flags = O_RDWR;
+	int fd;
 
-static struct process_context *process_context_create(void)
+	if (use_direct_io)
+		flags |= O_DIRECT;
+
+	fd = open(device_file_name, flags);
+	if (fd < 0)
+		perror("Cannot open block device file");
+
+	return fd;
+}
+
+static int process_context_setup(struct process_context *ctx)
 {
-	struct process_context *ctx = malloc(sizeof(struct process_context));
 	int ret;
-
-	if (!ctx) {
-		ERR("Cannot allocate process_context\n");
-		return 0;
-	}
 
 	ctx->io_ctx = 0;
 	ctx->size = number_of_events;
 	ctx->running = 0;
+	ctx->fd = open_disk_file();
+
+	if (ctx->fd < 0)
+		return 1;
+
+	ctx->cache = object_cache_create(sizeof(struct iocb));
+	if (!ctx->cache) {
+		ERR("Cannot create iocb cache\n");
+		close(ctx->fd);
+		return 1;
+	}
+
 	ctx->events = calloc(number_of_events, sizeof(struct io_event));
 	if (!ctx->events) {
 		ERR("Cannot allocate array of io_event\n");
-		free(ctx);
-		return 0;
+		object_cache_destroy(ctx->cache);
+		close(ctx->fd);
+		return 1;
 	}
 
 	if ((ret = io_setup(number_of_events, &ctx->io_ctx))) {
 		ERR("Cannot initialize AIO context (%d)\n", -ret);
 		free(ctx->events);
-		free(ctx);
-		return 0;
+		object_cache_destroy(ctx->cache);
+		close(ctx->fd);
+		return 1;
 	}
 
-	return ctx;
+	return 0;
 }
 
 static void process_context_destroy(struct process_context *ctx)
@@ -585,12 +636,13 @@ static void process_context_destroy(struct process_context *ctx)
 		if (ret < 0)
 			ERR("Error %d, while reclaiming IO\n", -ret);
 		else
-			io_events_check_and_release(ctx->events, ret);
+			io_events_check_and_release(ctx, ret);
 	}
 
 	io_destroy(ctx->io_ctx);
 	free(ctx->events);
-	free(ctx);
+	object_cache_destroy(ctx->cache);
+	close(ctx->fd);
 }
 
 /**
@@ -602,7 +654,7 @@ static void process_context_destroy(struct process_context *ctx)
  *
  * Returns 0, if success.
  */
-static int blkio_stats_play(struct process_context *ctx, int fd,
+static int blkio_stats_play(struct process_context *ctx,
 			const struct blkio_stats *stat)
 {
 	const long ios = stat->reads + stat->writes;
@@ -619,7 +671,7 @@ static int blkio_stats_play(struct process_context *ctx, int fd,
 		return 1;
 	}
 
-	if (iocbs_fill(iocbs, fd, stat)) {
+	if (iocbs_fill(iocbs, ctx, stat)) {
 		free(iocbs);
 		return 1;
 	}
@@ -632,7 +684,7 @@ static int blkio_stats_play(struct process_context *ctx, int fd,
 		if (ctx->running < iodepth)
 			submit = MIN(ios - submit_i, iodepth - ctx->running);
 
-		submitted = iocbs_submit(ctx->io_ctx, iocbs + submit_i, submit);
+		submitted = iocbs_submit(ctx, iocbs + submit_i, submit);
 		submit_i += submitted;
 		ctx->running += submitted;
 
@@ -654,15 +706,32 @@ static int blkio_stats_play(struct process_context *ctx, int fd,
 		}
 		ctx->running -= reclaimed;
 
-		if (io_events_check_and_release(ctx->events, reclaimed)) {
+		if (io_events_check_and_release(ctx, reclaimed)) {
 			rc = 1;
 			break;
 		}
 	}
 
-	iocbs_release(iocbs + submit_i, ios - submit_i);
+	iocbs_release(ctx, iocbs + submit_i, ios - submit_i);
 	free(iocbs);
 	return rc;
+}
+
+static void play(int fd)
+{
+	struct process_context ctx;
+	struct blkio_stats stats;
+
+	if (process_context_setup(&ctx)) {
+		ERR("Cannot create process context\n");
+		return;
+	}
+
+	while (!blkio_stats_read(fd, &stats)) {
+		if (blkio_stats_play(&ctx, &stats))
+			break;
+	}
+	process_context_destroy(&ctx);
 }
 
 static int open_input_file(void)
@@ -675,113 +744,117 @@ static int open_input_file(void)
 	return fd;
 }
 
-static int open_disk_file(void)
-{	
-	int flags = O_RDWR;
-	int fd;
-
-	if (use_direct_io)
-		flags |= O_DIRECT;
-
-	fd = open(device_file_name, flags);
-	if (fd < 0)
-		perror("Cannot open block device file");
-
-	return fd;
+static int play_process_pid_compare(const struct play_process *l,
+			const struct play_process *r)
+{
+	if (l->pid < r->pid)
+		return -1;
+	if (l->pid > r->pid)
+		return 1;
+	return 0;
 }
 
-static void play_pid(unsigned long pid)
+static void __play_pids(int fd, struct play_process *pids, unsigned size)
 {
-	struct process_context *ctx;
-	struct blkio_stats stat;
-	int ifd, dfd;
+	struct blkio_stats stats;
 
-	ifd = open_input_file();
-	if (ifd < 0)
-		return;
+	while (!blkio_stats_read(fd, &stats)) {
+		struct play_process key;
+		unsigned i;
 
-	dfd = open_disk_file();
-	if (dfd < 0) {
-		close(ifd);
-		return;
-	}
+		key.pid = stats.pid;
+		i = lower_bound(pids, size, key, &play_process_pid_compare);
 
-	iocb_cache = object_cache_create(sizeof(struct iocb));
-	if (!iocb_cache) {
-		ERR("Cannot create iocb cache\n");
-		close(dfd);
-		close(ifd);
-		return;
-	}
-
-	ctx = process_context_create();
-	if (!ctx) {
-		ERR("Cannot create process_context\n");
-		object_cache_destroy(iocb_cache);
-		close(dfd);
-		close(ifd);
-		return;
-	}
-
-	while (!blkio_stats_read(ifd, &stat)) {
-		if (stat.pid != pid)
+		if (i == size || pids[i].pid != key.pid)
 			continue;
 
-		if (blkio_stats_play(ctx, dfd, &stat))
+		if (blkio_stats_write(pids[i].fd, &stats))
 			break;
-	}
-
-	process_context_destroy(ctx);
-	object_cache_destroy(iocb_cache);
-	close(dfd);
-	close(ifd);
+	}	
 }
 
-static void play(void)
+static void play_pids(struct play_process *pids, unsigned size)
 {
-	#define MAX_PIDS 4096
-	unsigned long pids[MAX_PIDS];
-	unsigned long size = 0;
-	struct blkio_stats stat;
-	int fd;
+	unsigned i;
+	int fd, fail = 0;
+
+	for (i = 0; i != size; ++i) {
+		int pfds[2], ret;
+		unsigned j;
+
+		if (pipe(pfds)) {
+			perror("Cannot create pipe for play process");
+			fail = 1;
+			for (j = 0; j != i; ++j)
+				close(pids[j].fd);
+			break;
+		}
+
+		pids[i].fd = pfds[1];
+		ret = fork();
+		if (ret < 0) {
+			perror("Cannot create play process");
+			fail = 1;
+			close(pfds[0]);
+			close(pfds[1]);
+			for (j = 0; j != i; ++j)
+				close(pids[j].fd);
+			break;
+		}
+
+		pids[i].rpid = ret;
+		if (!ret) {
+			for (j = 0; j != i; ++j)
+				close(pids[j].fd);
+			close(pfds[1]);
+			play(pfds[0]);
+			close(pfds[0]);
+			return;
+		}
+	}
 
 	fd = open_input_file();
+	if (!fail && fd >= 0) {
+		sort(pids, size, &play_process_pid_compare);
+		__play_pids(fd, pids, size);
+		for (i = 0; i != size; ++i)
+			close(pids[i].fd);
+		close(fd);
+	}
+
+	for (i = 0; i != size; ++i)
+		waitpid(pids[i].rpid, NULL, 0);
+}
+
+static void find_and_play_pids(void)
+{
+	struct blkio_stats stats;
+	unsigned i;
+
+	int fd = open_input_file();
 	if (fd < 0)
 		return;
 
-	while (!blkio_stats_read(fd, &stat)) {
-		const unsigned long pid = stat.pid;
-		unsigned long i;
+	while (!blkio_stats_read(fd, &stats)) {
+		const unsigned long pid = stats.pid;
+		int found = 0;
 
-		for (i = 0; i != size; ++i)
-			if (pids[i] == pid)
+		for (i = 0; i != pids_to_play_size; ++i) {
+			if (pids_to_play[i].pid == pid) {
+				found = 1;
 				break;
-
-		if (i == size) {
-			pid_t child;
-			pids[size++] = pid;
-
-			child = fork();
-			if (child < 0) {
-				ERR("Cannot create child process\n");
-				break;
-			}
-
-			if (child == 0) {
-				close(fd);
-				play_pid(pid);
-				return;
 			}
 		}
-	}
-	close(fd);
 
-	while (size--) {
-		errno = 0;
-		if (wait(NULL) == -1 && errno == ECHILD)
-			break;
+		if (!found) {
+			assert(pids_to_play_size != MAX_PIDS_SIZE
+						&& "pids array too small");
+			pids_to_play[pids_to_play_size++].pid = pid;
+		}
 	}
-	#undef MAX_PIDS
+
+	close(fd);
+	play_pids(pids_to_play, pids_to_play_size);
 }
 
 int main(int argc, char **argv)
@@ -790,10 +863,10 @@ int main(int argc, char **argv)
 		return 1;
 
 	srand(time(NULL));
-	if (pid != -1)
-		play_pid(pid);
+	if (pids_to_play_size)
+		play_pids(pids_to_play, pids_to_play_size);
 	else
-		play();
+		find_and_play_pids();
 
 	return 0;
 }
