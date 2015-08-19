@@ -4,7 +4,7 @@ iodepth=16
 size=512m
 bs=512
 numjobs=1
-filename=/dev/nullb0
+filename=/dev/sdb
 norandommap
 [f1]
 rw=write
