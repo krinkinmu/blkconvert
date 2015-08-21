@@ -20,7 +20,7 @@ struct object_cache *object_cache_create(size_t object_size)
 	}
 
 	cache->object_size = MAX(object_size, sizeof(struct list_head));
-	list_init(&cache->head);
+	list_head_init(&cache->head);
 	return cache;
 }
 

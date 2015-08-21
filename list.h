@@ -10,7 +10,7 @@ struct list_head {
 
 #define list_entry(ptr, type, field) container_of(ptr, type, field)
 
-static inline void list_init(struct list_head *head)
+static inline void list_head_init(struct list_head *head)
 { head->next = head->prev = head; }
 
 static inline int list_empty(const struct list_head *head)
