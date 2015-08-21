@@ -712,7 +712,8 @@ static void blkio_event_handle_complete(struct blkio_queue *queue,
 			struct process_info *pi;
 
 			pi = list_entry(pos, struct process_info, head);
-			if (pi->pid == node->event.pid) {
+			if (pi->pid == node->event.pid &&
+					node->event.time >= pi->events->time) {
 				process_info_append(pi, event);
 				break;
 			}
