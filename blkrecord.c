@@ -20,8 +20,7 @@
 
 static const char *input_file_name;
 static const char *output_file_name;
-static unsigned min_time_interval = 5000u;
-static unsigned long min_batch_size = 10000ul;
+static unsigned min_time_interval = 1000u;
 static unsigned sector_size = 512u;
 static int binary = 1;
 static int per_process = 0;
@@ -32,14 +31,12 @@ static void show_usage(const char *name)
 		"[-f <input file>    | --file=<input file>]\n" \
 		"[-o <output file>   | --output=<output file>]\n" \
 		"[-i <time interval> | --interval=<time interval>]\n" \
-		"[-b <batch size>    | --batch=<batch size>]\n" \
 		"[-s <sector size>   | --sector=<sector size>]\n" \
 		"[-t                 | --text]\n" \
 		"[-p                 | --per-process]\n" \
 		"\t-f Use specified blktrace file. Default: stdin\n" \
 		"\t-o Ouput file. Default: stdout\n" \
-		"\t-i Minimum sampling time interval in ms. Default: 5000\n" \
-		"\t-b Minimum io batch size. Default: 10000\n" \
+		"\t-i Minimum sampling time interval in ms. Default: 1000\n" \
 		"\t-s Sector size. Default: 512\n" \
 		"\t-t Output in text format, by default output is binary.\n" \
 		"\t-p Use per process stats.\n";
@@ -69,12 +66,6 @@ static int parse_args(int argc, char **argv)
 			.val = 'i'
 		},
 		{
-			.name = "batch",
-			.has_arg = required_argument,
-			.flag = NULL,
-			.val = 'b'
-		},
-		{
 			.name = "sector",
 			.has_arg = required_argument,
 			.flag = NULL,
@@ -96,7 +87,7 @@ static int parse_args(int argc, char **argv)
 			.name = NULL
 		}
 	};
-	static const char *opts = "f:o:i:b:s:tp";
+	static const char *opts = "f:o:i:s:tp";
 
 	long i;
 	int c;
@@ -116,14 +107,6 @@ static int parse_args(int argc, char **argv)
 				return 1;
 			}
 			min_time_interval = i;
-			break;
-		case 'b':
-			i = atol(optarg);
-			if (i <= 0) {
-				ERR("Batch size must be positive\n");
-				return 1;
-			}
-			min_batch_size = i;
 			break;
 		case 's':
 			i = atol(optarg);
@@ -230,16 +213,6 @@ static int accept_event(const struct blkio_event *event)
 	return is_queue_event(event) || is_complete_event(event);
 }
 
-static int blkio_event_time_compare(const struct blkio_event *l,
-			const struct blkio_event *r)
-{
-	if (l->time < r->time)
-		return -1;
-	if (l->time > r->time)
-		return 1;
-	return 0;
-}
-
 static int blkio_event_offset_compare(const struct blkio_event *l,
 			const struct blkio_event *r)
 {
@@ -250,41 +223,12 @@ static int blkio_event_offset_compare(const struct blkio_event *l,
 	return 0;
 }
 
-static int blkio_event_pid_compare(const struct blkio_event *l,
-			const struct blkio_event *r)
-{
-	if (l->pid < r->pid)
-		return -1;
-	if (l->pid > r->pid)
-		return 1;
-	return 0;
-}
-
-static int blkio_event_pid_time_compare(const struct blkio_event *l,
-			const struct blkio_event *r)
-{
-	const int ret = blkio_event_pid_compare(l, r);
-	if (ret)
-		return ret;
-	return blkio_event_time_compare(l, r);
-}
-
 /**
  * blkio_events_sort_by_offset - sort events by offset in ascending order
  */
 static void blkio_events_sort_by_offset(struct blkio_event *events, size_t size)
 {
 	sort(events, size, &blkio_event_offset_compare);
-}
-
-/**
- * blkio_events_sort_by_pid_and_time - sort events by pair (pid, time) in
- *                                     ascending order.
- */
-static void blkio_events_sort_by_pid_time(struct blkio_event *events,
-			size_t size)
-{
-	sort(events, size, &blkio_event_pid_time_compare);
 }
 
 static int blkio_stats_dump(int fd, const struct blkio_stats *stats)
@@ -534,19 +478,16 @@ static int account_events(int fd, const struct blkio_event *events,
 	return blkio_stats_dump(fd, &stats);
 }
 
-struct blkio_node {
-	struct rb_node link;
-	struct blkio_event event;
-};
-
 static struct object_cache *blkio_node_cache;
 
 static struct blkio_queue_node *blkio_node_alloc(void)
 {
 	struct blkio_queue_node *node = object_cache_alloc(blkio_node_cache);
 
-	if (!node)
+	if (!node) {
+		ERR("Cannot allocate blkio_queue_node\n");
 		return 0;
+	}
 
 	memset(node, 0, sizeof(*node));
 	return node;
@@ -607,62 +548,6 @@ static void __blkio_queue_insert(struct blkio_queue *queue,
 	}
 	rb_link_node(&node->rb_node, parent, p);
 	rb_insert_color(&node->rb_node, &queue->rb_root);
-	++queue->size;
-}
-
-static int blkio_queue_insert(struct blkio_queue *queue,
-			struct blkio_event *event)
-{
-	unsigned long long from, to;
-	struct blkio_queue_node *pos, *node;
-	struct rb_node *list = 0;
-	int ret = 0, write;
-
-	if (is_queue_event(event)) {
-		node = blkio_node_alloc();
-		if (!node) {
-			ERR("Cannot allocate blkio_queue_node\n");
-			return 1;
-		}
-		node->event = *event;
-		__blkio_queue_insert(queue, node);
-		return 0;
-	}
-
-	from = event->sector;
-	to = from + event->length;
-	write = is_write_event(event);
-
-	pos = blkio_queue_lower(queue, from);
-	for (; pos && pos->event.sector < to; pos = blkio_queue_next(pos)) {
-		const unsigned long long begin = pos->event.sector;
-		const unsigned long long end = begin + pos->event.length;
-
-		if (to < end
-				|| is_complete_event(&pos->event)
-				|| is_write_event(&pos->event) != write)
-			continue;
-
-		node = blkio_node_alloc();
-		if (!node) {
-			ERR("Cannot allocate blkio_queue_node\n");
-			ret = 1;
-			break;
-		}
-		node->event = *event;
-		node->event.pid = pos->event.pid;
-		node->event.sector = pos->event.sector;
-		node->event.length = pos->event.length;
-		node->rb_node.rb_right = list;
-		list = &node->rb_node;
-	}
-
-	while (list) {
-		node = rb_entry(list, struct blkio_queue_node, rb_node);
-		list = list->rb_right;
-		__blkio_queue_insert(queue, node);
-	}
-	return ret;
 }
 
 static void __blkio_queue_clear(struct rb_node *node)
@@ -683,103 +568,184 @@ static void blkio_queue_clear(struct blkio_queue *queue)
 	memset(queue, 0, sizeof(*queue));
 }
 
-static int blkio_queue_handle_events(int fd, struct blkio_queue *queue)
+static int process_info_append(struct process_info *pi,
+			const struct blkio_event *event)
 {
-	struct blkio_queue_node *node;
-	struct rb_node *pos;
-	int ret = 0;
+	static const unsigned long grow_n = 3;
+	static const unsigned long grow_d = 2;
 
-	struct blkio_event *events = calloc(queue->size,
-				sizeof(struct blkio_event));
-	unsigned long size = 0, i, min_i;
+	if (pi->size == pi->capacity) {
+		unsigned long new_capacity = (pi->capacity * grow_n) / grow_d;
+		struct blkio_event *events = realloc(pi->events,
+					sizeof(*event) * new_capacity);
 
-	if (!events) {
-		ERR("Cannot allocate array of blkio_event\n");
-		return 1;
+		if (!events) {
+			ERR("process_info events reallocation failed\n");
+			return 1;
+		}
+
+		pi->capacity = new_capacity;
+		pi->events = events;
+	}
+	pi->events[pi->size++] = *event;
+	return 0;
+}
+
+static struct process_info *process_info_alloc(void)
+{
+	static unsigned long CAPACITY = 512;
+
+	struct process_info *pi = malloc(sizeof(struct process_info));
+
+	if (!pi) {
+		ERR("Process info allocation failed\n");
+		return 0;
 	}
 
-	pos = rb_first(&queue->rb_root);
-	while (pos) {
-		node = rb_entry(pos, struct blkio_queue_node, rb_node);
-		events[size++] = node->event;
-		pos = rb_next(pos);
-	}
-	blkio_queue_clear(queue);
-
-	/**
-	 * Things a bit complicated when we take time into account, we want
-	 * PID with minimum start time goes first, so we find it first, and
-	 * then dump stats in two steps: starting from min PID and then from
-	 * first PID in the array.
-	 */
-	blkio_events_sort_by_pid_time(events, size);
-	min_i = 0;
-	for (i = 0; !ret && i != size; ) {
-		const unsigned long pid = events[i].pid;
-		const unsigned long j = i;
-
-		for (; i != size && events[i].pid == pid; ++i);
-		if (events[j].time < events[min_i].time)
-			min_i = j;
+	pi->events = calloc(CAPACITY, sizeof(*pi->events));
+	if (!pi->events) {
+		ERR("blkio_event per process array allocation failed\n");
+		free(pi);
+		return 0;
 	}
 
-	for (i = min_i; !ret && i != size; ) {
-		const unsigned long pid = events[i].pid;
-		const unsigned long j = i;
+	pi->capacity = CAPACITY;
+	pi->size = 0;
+	return pi;
+}
 
-		for (; i != size && events[i].pid == pid; ++i);
-		ret = account_events(fd, events + j, i - j);
+static void process_info_free(struct process_info *pi)
+{
+	free(pi->events);
+	free(pi);
+}
+
+static void process_info_dump(int fd, struct process_info *pi)
+{ account_events(fd, pi->events, pi->size); }
+
+static void blkio_queue_dump(struct blkio_queue *queue,
+			unsigned long long time)
+{
+	static const unsigned long long NS = 1000000ull;
+	const unsigned long long TI = NS * min_time_interval;
+
+	struct list_head *head = &queue->head;
+	struct list_head *pos = head->next;
+
+	while (pos != head) {
+		struct process_info *pi;
+
+		pi = list_entry(pos, struct process_info, head);
+		pos = pos->next;
+
+		if (pi->events->time + TI > time)
+			break;
+
+		process_info_dump(queue->fd, pi);
+		list_unlink(&pi->head);
+		process_info_free(pi);
+	}
+}
+
+static void blkio_event_handle_queue(struct blkio_queue *queue,
+			const struct blkio_event *event)
+{
+	struct list_head *head = &queue->head;
+	struct list_head *pos = head->next;
+	int found = 0;
+
+	struct blkio_queue_node *node = blkio_node_alloc();
+
+	if (!node)
+		return;
+
+	for(; pos != head; pos = pos->next) {
+		struct process_info *pi;
+
+		pi = list_entry(pos, struct process_info, head);
+		if (pi->pid == event->pid) {
+			process_info_append(pi, event);
+			found = 1;
+			break;
+		}
 	}
 
-	for (i = 0; !ret && i != min_i; ) {
-		const unsigned long pid = events[i].pid;
-		const unsigned long j = i;
+	if (!found) {
+		struct process_info *pi = process_info_alloc();
 
-		for (; i != size && events[i].pid == pid; ++i);
-		ret = account_events(fd, events + j, i - j);
+		if (!pi) {
+			blkio_node_free(node);
+			return;
+		}
+		pi->pid = event->pid;
+		list_link_before(head, &pi->head);
+		process_info_append(pi, event);
 	}
+	node->event = *event;
+	__blkio_queue_insert(queue, node);
+}
 
-	free(events);
-	return ret;
+static void blkio_event_handle_complete(struct blkio_queue *queue,
+			const struct blkio_event *event)
+{
+	const unsigned long long from = event->sector;
+	const unsigned long long to = from + event->length;
+	const int wr = is_write_event(event);
+
+	struct blkio_queue_node *qn = blkio_queue_lower(queue, from);
+
+	while (qn && qn->event.sector < to) {
+		const unsigned long long begin = qn->event.sector;
+		const unsigned long long end = begin + qn->event.length;
+
+		struct blkio_queue_node *node = qn;
+		struct list_head *head = &queue->head;
+		struct list_head *pos = head->next;
+
+		qn = blkio_queue_next(qn);
+		if (to < end || is_write_event(&node->event) != wr)
+			continue;
+
+		rb_erase(&node->rb_node, &queue->rb_root);
+
+		for (; pos != head; pos = pos->next) {
+			struct process_info *pi;
+
+			pi = list_entry(pos, struct process_info, head);
+			if (pi->pid == node->event.pid) {
+				process_info_append(pi, event);
+				break;
+			}
+		}
+		blkio_node_free(node);
+	}
+}
+
+static void blkio_event_handle(struct blkio_queue *queue,
+			const struct blkio_event *event)
+{
+	blkio_queue_dump(queue, event->time);
+	if (is_queue_event(event))
+		blkio_event_handle_queue(queue, event);
+	else
+		blkio_event_handle_complete(queue, event);
 }
 
 static void blkrecord(int ifd, int ofd)
 {
-	const unsigned long long NS = 1000000ull;
-	const unsigned long long TI = NS * min_time_interval;
-	const unsigned long BS = min_batch_size;
-
-	unsigned long long start_time = 0ull;
-	unsigned long long end_time = 0ull;
-
 	struct blkio_queue queue;
 	struct blkio_event event;
 
-	memset(&queue, 0, sizeof(queue));
-
+	blkio_queue_init(&queue, ofd);
 	while (!blkio_event_read(ifd, &event)) {
 		if (!accept_event(&event))
 			continue;
 
-		if (event.time < start_time) {
-			ERR("Out of order event, skip it\n");
-			continue;
-		}
-
-		if (blkio_queue_insert(&queue, &event))
-			break;
-
-		end_time = MAX(end_time, event.time);
-		if (queue.size < BS && end_time - start_time < TI)
-			continue;
-
-		start_time = end_time;
-		if (blkio_queue_handle_events(ofd, &queue))
-			break;
+		blkio_event_handle(&queue, &event);
 	}
 
-	if (queue.size)
-		blkio_queue_handle_events(ofd, &queue);
+	blkio_queue_dump(&queue, ~0ull);
+	blkio_queue_clear(&queue);
 }
 
 int main(int argc, char **argv)

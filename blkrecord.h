@@ -4,6 +4,7 @@
 #include <asm/types.h>
 
 #include "rbtree.h"
+#include "list.h"
 
 #define SECTOR_SIZE_BITS 16
 #define SPOT_OFFSET_BITS 64
@@ -42,9 +43,23 @@ struct blkio_queue_node {
 	struct blkio_event event;
 };
 
-struct blkio_queue {
-	struct rb_root rb_root;
-	unsigned long size;
+struct process_info {
+	struct list_head head;
+	struct blkio_event *events;
+	unsigned long size, capacity, pid;
 };
+
+struct blkio_queue {
+	struct list_head head;
+	struct rb_root rb_root;
+	int fd;
+};
+
+static inline void blkio_queue_init(struct blkio_queue *queue, int fd)
+{
+	list_head_init(&queue->head);
+	queue->rb_root.rb_node = NULL;
+	queue->fd = fd;
+}
 
 #endif /*__BLKRECORD_H__*/
