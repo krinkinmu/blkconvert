@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <signal.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -24,6 +25,8 @@ static unsigned min_time_interval = 1000u;
 static unsigned sector_size = 512u;
 static int binary = 1, use_compression = 0;
 static int per_process = 0;
+
+static volatile int done = 0;
 
 static void show_usage(const char *name)
 {
@@ -777,15 +780,20 @@ static void blkrecord(struct blkio_queue *queue)
 {
 	struct blkio_event event;
 
-	while (!blkio_event_read(queue, &event)) {
+	while (!done && !blkio_event_read(queue, &event)) {
 		if (!accept_event(&event))
 			continue;
 
 		blkio_event_handle(queue, &event);
 	}
-
 	blkio_queue_dump(queue, ~0ull);
 	blkio_queue_clear(queue);
+}
+
+static void handle_signal(int sig)
+{
+	(void)sig;
+	done = 1;
 }
 
 int main(int argc, char **argv)
@@ -830,6 +838,11 @@ int main(int argc, char **argv)
 
 	blkio_node_cache = object_cache_create(sizeof(struct blkio_queue_node));
 	if (blkio_node_cache) {
+		signal(SIGINT, handle_signal);
+		signal(SIGHUP, handle_signal);
+		signal(SIGTERM, handle_signal);
+		signal(SIGALRM, handle_signal);
+
 		blkio_queue_init(&queue);
 		queue.zofd = zofd;
 		queue.ifd = ifd;
