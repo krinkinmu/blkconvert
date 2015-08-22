@@ -22,7 +22,7 @@ static const char *input_file_name;
 static const char *output_file_name;
 static unsigned min_time_interval = 1000u;
 static unsigned sector_size = 512u;
-static int binary = 1;
+static int binary = 1, use_compression = 0;
 static int per_process = 0;
 
 static void show_usage(const char *name)
@@ -32,12 +32,14 @@ static void show_usage(const char *name)
 		"[-o <output file>   | --output=<output file>]\n" \
 		"[-i <time interval> | --interval=<time interval>]\n" \
 		"[-s <sector size>   | --sector=<sector size>]\n" \
+		"[-c                 | --compress]\n" \
 		"[-t                 | --text]\n" \
 		"[-p                 | --per-process]\n" \
 		"\t-f Use specified blktrace file. Default: stdin\n" \
 		"\t-o Ouput file. Default: stdout\n" \
 		"\t-i Minimum sampling time interval in ms. Default: 1000\n" \
 		"\t-s Sector size. Default: 512\n" \
+		"\t-c Compress output data using zlib. Default: disabled\n" \
 		"\t-t Output in text format, by default output is binary.\n" \
 		"\t-p Use per process stats.\n";
 
@@ -72,6 +74,12 @@ static int parse_args(int argc, char **argv)
 			.val = 's'
 		},
 		{
+			.name = "compress",
+			.has_arg = no_argument,
+			.flag = NULL,
+			.val = 'c'
+		},
+		{
 			.name = "text",
 			.has_arg = no_argument,
 			.flag = NULL,
@@ -87,7 +95,7 @@ static int parse_args(int argc, char **argv)
 			.name = NULL
 		}
 	};
-	static const char *opts = "f:o:i:s:tp";
+	static const char *opts = "f:o:i:s:ctp";
 
 	long i;
 	int c;
@@ -115,6 +123,9 @@ static int parse_args(int argc, char **argv)
 				return 1;
 			}
 			sector_size = i;
+			break;
+		case 'c':
+			use_compression = 1;
 			break;
 		case 't':
 			binary = 0;
@@ -155,17 +166,17 @@ static int blk_io_trace_to_cpu(struct blk_io_trace *trace)
  * blkio_event_read - reads struct blk_io_trace and converts
  * it to a struct blkio_event.
  *
- * fd - input file descriptor
+ * queue - initialized blkio_queue
  * event - blkio_event to read to
  *
  * Returns 0, if succes.
  */
-static int blkio_event_read(int fd, struct blkio_event *event)
+static int blkio_event_read(struct blkio_queue *q, struct blkio_event *event)
 {
 	struct blk_io_trace trace;
 	size_t to_skip;
 
-	if (myread(fd, (void *)&trace, sizeof(trace)))
+	if (myread(q->ifd, (void *)&trace, sizeof(trace)))
 		return 1;
 
 	if (blk_io_trace_to_cpu(&trace))
@@ -175,7 +186,7 @@ static int blkio_event_read(int fd, struct blkio_event *event)
 	while (to_skip) {
 		char buf[256];
 
-		if (myread(fd, buf, MIN(to_skip, sizeof(buf))))
+		if (myread(q->ifd, buf, MIN(to_skip, sizeof(buf))))
 			return 1;
 		to_skip -= MIN(to_skip, sizeof(buf)); 
 	}
@@ -231,42 +242,72 @@ static void blkio_events_sort_by_offset(struct blkio_event *events, size_t size)
 	sort(events, size, &blkio_event_offset_compare);
 }
 
-static int blkio_stats_dump(int fd, const struct blkio_stats *stats)
+static int mygzwrite(gzFile zfd, const char *buf, size_t size)
+{
+	size_t written = 0;
+
+	while (written != size) {
+		int ret = gzwrite(zfd, buf + written, size - written);
+
+		if (!ret) {
+			int gzerr = 0;
+			const char *msg = gzerror(zfd, &gzerr);
+
+			if (gzerr != Z_ERRNO)
+				ERR("zlib write failed: %s\n", msg);
+			else
+				perror("Write failed");
+			return 1;
+		}
+		written += ret;
+	}
+	return 0;
+}
+
+static int blkio_queue_write(struct blkio_queue *q, const char *data,
+			size_t size)
+{
+	if (q->zofd)
+		return mygzwrite(q->zofd, data, size);
+	return mywrite(q->ofd, data, size);
+}
+
+static int blkio_stats_dump(struct blkio_queue *q, const struct blkio_stats *st)
 {
 	unsigned long long first = ~0ull, last = 0ull;
 	char buffer[512];
 
-	if (stats->reads + stats->writes == 0)
+	if (st->reads + st->writes == 0)
 		return 0;
 
 	if (binary)
-		return mywrite(fd, (const char *)stats, sizeof(*stats));
+		return blkio_queue_write(q, (const char *)st, sizeof(*st));
 
-	if (stats->reads) {
-		first = MIN(first, stats->reads_layout.first_sector);
-		last = MAX(last, stats->reads_layout.last_sector);
+	if (st->reads) {
+		first = MIN(first, st->reads_layout.first_sector);
+		last = MAX(last, st->reads_layout.last_sector);
 	}
 
-	if (stats->writes) {
-		first = MIN(first, stats->writes_layout.first_sector);
-		last = MAX(last, stats->writes_layout.last_sector);
+	if (st->writes) {
+		first = MIN(first, st->writes_layout.first_sector);
+		last = MAX(last, st->writes_layout.last_sector);
 	}
 
 	snprintf(buffer, 512, "pid=%lu begin=%llu end=%llu "
 				"inversions=%llu reads=%lu writes=%lu "
 				"avg_iodepth=%lu avg_batch=%lu "
 				"first_sec=%llu last_sec=%llu\n",
-				(unsigned long)stats->pid,
-				(unsigned long long)stats->begin_time,
-				(unsigned long long)stats->end_time,
-				(unsigned long long)stats->inversions,
-				(unsigned long)stats->reads,
-				(unsigned long)stats->writes,
-				(unsigned long)stats->iodepth,
-				(unsigned long)stats->batch,
+				(unsigned long)st->pid,
+				(unsigned long long)st->begin_time,
+				(unsigned long long)st->end_time,
+				(unsigned long long)st->inversions,
+				(unsigned long)st->reads,
+				(unsigned long)st->writes,
+				(unsigned long)st->iodepth,
+				(unsigned long)st->batch,
 				first, last);
 
-	return mywrite(fd, buffer, strlen(buffer));
+	return blkio_queue_write(q, buffer, strlen(buffer));
 }
 
 /**
@@ -458,8 +499,8 @@ static int account_general_stats(struct blkio_stats *stats,
 	return 0;
 }
 
-static int account_events(int fd, const struct blkio_event *events,
-			size_t size)
+static int account_events(struct blkio_queue *q,
+			const struct blkio_event *events, size_t size)
 {
 	struct blkio_stats stats;
 
@@ -475,7 +516,7 @@ static int account_events(int fd, const struct blkio_event *events,
 	if (account_disk_layout_stats(&stats, events, size))
 		return 1;
 
-	return blkio_stats_dump(fd, &stats);
+	return blkio_stats_dump(q, &stats);
 }
 
 static struct object_cache *blkio_node_cache;
@@ -620,8 +661,8 @@ static void process_info_free(struct process_info *pi)
 	free(pi);
 }
 
-static void process_info_dump(int fd, struct process_info *pi)
-{ account_events(fd, pi->events, pi->size); }
+static void process_info_dump(struct blkio_queue *q, struct process_info *pi)
+{ account_events(q, pi->events, pi->size); }
 
 static void blkio_queue_dump(struct blkio_queue *queue,
 			unsigned long long time)
@@ -641,7 +682,7 @@ static void blkio_queue_dump(struct blkio_queue *queue,
 		if (pi->events->time + TI > time)
 			break;
 
-		process_info_dump(queue->fd, pi);
+		process_info_dump(queue, pi);
 		list_unlink(&pi->head);
 		process_info_free(pi);
 	}
@@ -732,26 +773,27 @@ static void blkio_event_handle(struct blkio_queue *queue,
 		blkio_event_handle_complete(queue, event);
 }
 
-static void blkrecord(int ifd, int ofd)
+static void blkrecord(struct blkio_queue *queue)
 {
-	struct blkio_queue queue;
 	struct blkio_event event;
 
-	blkio_queue_init(&queue, ofd);
-	while (!blkio_event_read(ifd, &event)) {
+	while (!blkio_event_read(queue, &event)) {
 		if (!accept_event(&event))
 			continue;
 
-		blkio_event_handle(&queue, &event);
+		blkio_event_handle(queue, &event);
 	}
 
-	blkio_queue_dump(&queue, ~0ull);
-	blkio_queue_clear(&queue);
+	blkio_queue_dump(queue, ~0ull);
+	blkio_queue_clear(queue);
 }
 
 int main(int argc, char **argv)
 {
+	struct blkio_queue queue;
+
 	int ifd = 0, ofd = 1;
+	gzFile zofd = NULL;
 
 	if (parse_args(argc, argv))
 		return 1;
@@ -772,17 +814,36 @@ int main(int argc, char **argv)
 			perror("Cannot open output file");
 			return 1;
 		}
+
+	}
+
+	if (use_compression) {
+		zofd = gzdopen(ofd, "wb");
+
+		if (!zofd) {
+			ERR("Cannot allocate enough memory for zlib\n");
+			close(ifd);
+			close(ofd);
+			return 1;
+		}
 	}
 
 	blkio_node_cache = object_cache_create(sizeof(struct blkio_queue_node));
 	if (blkio_node_cache) {
-		blkrecord(ifd, ofd);
+		blkio_queue_init(&queue);
+		queue.zofd = zofd;
+		queue.ifd = ifd;
+		queue.ofd = ofd;
+		blkrecord(&queue);
 		object_cache_destroy(blkio_node_cache);
 	} else {
 		ERR("Cannot create blkio_queue_node cache\n");
 	}
 
-	close(ofd);
+	if (zofd)
+		gzclose(zofd);
+	else
+		close(ofd);
 	close(ifd);
 
 	return 0;

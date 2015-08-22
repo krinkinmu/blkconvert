@@ -2,12 +2,13 @@
 #define __BLKRECORD_H__
 
 #include <asm/types.h>
+#include <zlib.h>
 
 #include "rbtree.h"
 #include "list.h"
 
-#define SECTOR_SIZE_BITS 16
-#define SPOT_OFFSET_BITS 64
+#define SECTOR_SIZE_BITS   16
+#define SPOT_OFFSET_BITS   64
 
 struct blkio_disk_layout {
 	__u64 first_sector;
@@ -52,14 +53,14 @@ struct process_info {
 struct blkio_queue {
 	struct list_head head;
 	struct rb_root rb_root;
-	int fd;
+	gzFile zofd;
+	int ifd, ofd;
 };
 
-static inline void blkio_queue_init(struct blkio_queue *queue, int fd)
+static inline void blkio_queue_init(struct blkio_queue *queue)
 {
 	list_head_init(&queue->head);
 	queue->rb_root.rb_node = NULL;
-	queue->fd = fd;
 }
 
 #endif /*__BLKRECORD_H__*/
