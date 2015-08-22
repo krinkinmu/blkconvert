@@ -2,8 +2,8 @@ CC      ?= gcc
 CFLAGS  ?= -O3 -Wall -Wextra -Werror -D_GNU_SOURCE
 LDFLAGS ?= 
 
-BLKPLAY_LDFLAGS   := $(LDFLAGS) -laio -lz
-BLKRECORD_LDFLAGS := $(LDFLAGS)
+BLKPLAY_LDFLAGS   := $(LDFLAGS) -laio
+BLKRECORD_LDFLAGS := $(LDFLAGS) -lz
 
 COMMON_SRC := algorithm.c object_cache.c file_io.c ctree.c list.c rbtree.c
 COMMON_DEP := $(COMMON_SRC:.c=.d)
