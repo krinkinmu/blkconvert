@@ -14,6 +14,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <zlib.h>
+
 #include "object_cache.h"
 #include "algorithm.h"
 #include "blkrecord.h"
@@ -180,6 +182,32 @@ static int blkio_stats_read(int fd, struct blkio_stats *stats)
 
 static int blkio_stats_write(int fd, const struct blkio_stats *stats)
 { return mywrite(fd, (char *)stats, sizeof(*stats)); }
+
+static int blkio_zstats_read(gzFile zfd, struct blkio_stats *stats)
+{
+	const size_t size = sizeof(*stats);
+	char *buf = (char *)stats;
+	size_t read = 0;
+
+	while (read != size) {
+		int ret = gzread(zfd, buf + read, size - read);
+
+		if (!ret) {
+			if (!gzeof(zfd)) {
+				int gzerr = 0;
+				const char *msg = gzerror(zfd, &gzerr);
+
+				if (gzerr != Z_ERRNO)
+					ERR("zlib read failed: %s\n", msg);
+				else
+					perror("Read failed");
+			}
+			return 1;
+		}
+		read += ret;
+	}
+	return 0;
+}
 
 static unsigned mylog2(unsigned long long x)
 {
@@ -734,16 +762,6 @@ static void play(int fd)
 	process_context_destroy(&ctx);
 }
 
-static int open_input_file(void)
-{
-	int fd = open(input_file_name, 0);
-
-	if (fd < 0)
-		perror("Cannot open input file");
-		
-	return fd;
-}
-
 static int play_process_pid_compare(const struct play_process *l,
 			const struct play_process *r)
 {
@@ -754,11 +772,11 @@ static int play_process_pid_compare(const struct play_process *l,
 	return 0;
 }
 
-static void __play_pids(int fd, struct play_process *pids, unsigned size)
+static void __play_pids(gzFile zfd, struct play_process *pids, unsigned size)
 {
 	struct blkio_stats stats;
 
-	while (!blkio_stats_read(fd, &stats)) {
+	while (!blkio_zstats_read(zfd, &stats)) {
 		struct play_process key;
 		unsigned i;
 
@@ -776,7 +794,7 @@ static void __play_pids(int fd, struct play_process *pids, unsigned size)
 static void play_pids(struct play_process *pids, unsigned size)
 {
 	unsigned i;
-	int fd, fail = 0;
+	int fail = 0;
 
 	for (i = 0; i != size; ++i) {
 		int pfds[2], ret;
@@ -813,13 +831,17 @@ static void play_pids(struct play_process *pids, unsigned size)
 		}
 	}
 
-	fd = open_input_file();
-	if (!fail && fd >= 0) {
-		sort(pids, size, &play_process_pid_compare);
-		__play_pids(fd, pids, size);
-		for (i = 0; i != size; ++i)
-			close(pids[i].fd);
-		close(fd);
+	if (!fail) {
+		gzFile zfd = gzopen(input_file_name, "rb");
+		if (zfd) {
+			sort(pids, size, &play_process_pid_compare);
+			__play_pids(zfd, pids, size);
+			for (i = 0; i != size; ++i)
+				close(pids[i].fd);
+			gzclose(zfd);
+		} else {
+			ERR("Cannot allocate enough memory for zlib\n");
+		}
 	}
 
 	for (i = 0; i != size; ++i)
@@ -830,12 +852,15 @@ static void find_and_play_pids(void)
 {
 	struct blkio_stats stats;
 	unsigned i;
+	gzFile zfd = 0;
 
-	int fd = open_input_file();
-	if (fd < 0)
+	zfd = gzopen(input_file_name, "rb");
+	if (!zfd) {
+		ERR("Cannot allocate enough memory for zlib\n");
 		return;
+	}
 
-	while (!blkio_stats_read(fd, &stats)) {
+	while (!blkio_zstats_read(zfd, &stats)) {
 		const unsigned long pid = stats.pid;
 		int found = 0;
 
@@ -853,7 +878,7 @@ static void find_and_play_pids(void)
 		}
 	}
 
-	close(fd);
+	gzclose(zfd);
 	play_pids(pids_to_play, pids_to_play_size);
 }
 
