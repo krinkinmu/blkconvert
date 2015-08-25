@@ -24,12 +24,15 @@
 #include "ctree.h"
 #include "debug.h"
 
+static const unsigned long long NS = 1000000000ull;
+
 static const char *input_file_name;
 static const char *device_file_name;
 static unsigned number_of_events = 512u;
 static unsigned sector_size = 512u;
 static unsigned page_size = 4096u;
 static int use_direct_io = 1;
+static int time_accurate = 0;
 
 struct play_process {
 	unsigned long pid;
@@ -49,12 +52,14 @@ static void show_usage(const char *name)
 		"[-e <number of events> | --events=<number of events>]\n" \
 		"[-s <sector size>      | --sector=<sector size>]\n" \
 		"[-p <pid>              | --pid=<pid>]\n" \
+		"[-t                    | --time]\n" \
 		"[-b                    | --buffered]\n" \
 		"\t-d Block device file. Must be specified.\n" \
 		"\t-f Use specified blkrecord file. Default: stdin\n" \
 		"\t-e Max number of concurrently processing events. Default: 512\n" \
 		"\t-s Block device sector size. Default: 512\n" \
 		"\t-p Process PID to play.\n" \
+		"\t-t Time accurate playing.\n" \
 		"\t-b Use buffered IO (do not use direct IO)\n";
 
 	ERR("Usage: %s %s", name, usage);
@@ -94,6 +99,12 @@ static int parse_args(int argc, char **argv)
 			.val = 'p'
 		},
 		{
+			.name = "time",
+			.has_arg = no_argument,
+			.flag = NULL,
+			.val = 't'
+		},
+		{
 			.name = "buffered",
 			.has_arg = no_argument,
 			.flag = NULL,
@@ -103,7 +114,7 @@ static int parse_args(int argc, char **argv)
 			.name = NULL
 		}
 	};
-	static const char *opts = "d:f:e:s:p:b";
+	static const char *opts = "d:f:e:s:p:tb";
 
 	unsigned j;
 	long i;
@@ -111,11 +122,11 @@ static int parse_args(int argc, char **argv)
 
 	while ((c = getopt_long(argc, argv, opts, long_opts, NULL)) >= 0) {
 		switch (c) {
-		case 'f':
-			input_file_name = optarg;
-			break;
 		case 'd':
 			device_file_name = optarg;
+			break;
+		case 'f':
+			input_file_name = optarg;
 			break;
 		case 'e':
 			i = atol(optarg);
@@ -151,6 +162,9 @@ static int parse_args(int argc, char **argv)
 			if (!found)
 				pids_to_play[pids_to_play_size++].pid = i;
 			break;
+		case 't':
+			time_accurate = 1;
+			break;
 		case 'b':
 			use_direct_io = 0;
 			break;
@@ -171,8 +185,6 @@ static int parse_args(int argc, char **argv)
 		show_usage(argv[0]);
 		return 1;
 	}
-
-	
 
 	return 0;
 }
@@ -704,6 +716,7 @@ static int blkio_stats_play(struct process_context *ctx,
 		return 1;
 	}
 
+	ERR("Play %lu events\n", ios);
 	submit_i = 0;
 	while (submit_i != ios) {
 		long submit = 0, reclaim = 1;
@@ -772,8 +785,19 @@ static int play_process_pid_compare(const struct play_process *l,
 	return 0;
 }
 
+static unsigned long long current_time(void)
+{
+	struct timespec time;
+
+	clock_gettime(CLOCK_MONOTONIC, &time);
+	return time.tv_sec * NS + time.tv_nsec;
+}
+
 static void __play_pids(gzFile zfd, struct play_process *pids, unsigned size)
 {
+	const unsigned long long play_time = current_time();
+
+	unsigned long long record_time = ~0ull;
 	struct blkio_stats stats;
 
 	while (!blkio_zstats_read(zfd, &stats)) {
@@ -785,6 +809,24 @@ static void __play_pids(gzFile zfd, struct play_process *pids, unsigned size)
 
 		if (i == size || pids[i].pid != key.pid)
 			continue;
+
+		if (record_time > stats.begin_time)
+			record_time = stats.begin_time;
+
+		if (time_accurate) {
+			const unsigned long long p_elapsed =
+						current_time() - play_time;
+			const unsigned long long r_elapsed =
+						stats.begin_time - record_time;
+
+			if (p_elapsed < r_elapsed) {
+				struct timespec wait;
+
+				wait.tv_sec = (r_elapsed - p_elapsed) / NS;
+				wait.tv_nsec = (r_elapsed - p_elapsed) % NS;
+				nanosleep(&wait, 0);
+			}
+		}
 
 		if (blkio_stats_write(pids[i].fd, &stats))
 			break;
@@ -835,6 +877,7 @@ static void play_pids(struct play_process *pids, unsigned size)
 		gzFile zfd = gzopen(input_file_name, "rb");
 		if (zfd) {
 			sort(pids, size, &play_process_pid_compare);
+			ERR("Start playing\n");
 			__play_pids(zfd, pids, size);
 			for (i = 0; i != size; ++i)
 				close(pids[i].fd);
