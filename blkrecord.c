@@ -778,6 +778,7 @@ static void blkio_event_handle(struct blkio_queue *queue,
 
 static void blkrecord(struct blkio_queue *queue)
 {
+	unsigned long events_total = 0;
 	struct blkio_event event;
 
 	while (!done && !blkio_event_read(queue, &event)) {
@@ -785,9 +786,11 @@ static void blkrecord(struct blkio_queue *queue)
 			continue;
 
 		blkio_event_handle(queue, &event);
+		++events_total;
 	}
 	blkio_queue_dump(queue, ~0ull);
 	blkio_queue_clear(queue);
+	ERR("total events processed: %lu\n", events_total);
 }
 
 static void handle_signal(int sig)
