@@ -438,6 +438,35 @@ static int __iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
 	const unsigned long long first = dl->first_sector;
 	const unsigned long long last = dl->last_sector;
 
+	unsigned long io_total = 0, io_count = 0, avg_io;
+	unsigned long long offset = first;
+	unsigned long i;
+
+	for (i = 0; i != SECTOR_SIZE_BITS; ++i) {
+		io_total += dl->io_size[i] * (1 << i);
+		io_count += dl->io_size[i];
+	}
+
+	if (!io_count)
+		return 0;
+
+	avg_io = (io_total + io_count - 1) / io_count;
+	for (i = 0; i != io_count; ++i) {
+		if (offset >= last)
+			offset -= (last - first);
+		
+		iocbs[i] = iocb_get(ctx, offset * 512, avg_io * 512, wr);
+		if (!iocbs[i]) {
+			iocbs_release(ctx, iocbs, i);
+			return 1;
+		}
+
+		offset += avg_io;
+		if (offset >= last)
+			offset -= (last - first);
+	}
+
+/*
 	unsigned long *spot_size, *io_size;
 	unsigned long long *spot_offset;
 	unsigned long long offset;
@@ -450,7 +479,8 @@ static int __iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
 
 	if (!ios)
 		return 0;
-
+*/
+/*
 	for (i = 0; i != SECTOR_SIZE_BITS; ++i)
 		spots += dl->merged_size[i];
 
@@ -485,16 +515,17 @@ static int __iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
 	for (i = 0, j = 0; i != SECTOR_SIZE_BITS; ++i) {
 		const size_t last = j + dl->merged_size[i];
 		for (; j != last; ++j)
-			spot_size[j] = 1ul << i;
+			spot_size[j] = 1ul << (i + 1);
 	}
 	RANDOM_SHUFFLE(spot_size, spots, unsigned long);
 
+	spot_offset[0] = 0;
 	for (i = 0, j = 1; i != SPOT_OFFSET_BITS; ++i) {
 		const size_t last = j + dl->spot_offset[i];
 		for (; j != last; ++j)
 			spot_offset[j] = 1ull << i;
 	}
-	RANDOM_SHUFFLE(spot_offset, spots - 1, unsigned long long);
+	RANDOM_SHUFFLE(spot_offset, spots, unsigned long long);
 
 	#define BYTES(sec) ((sec) * sector_size)
 	offset = first;
@@ -502,7 +533,7 @@ static int __iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
 	for (i = 0; i != ios;) {
 		const unsigned long size = spot_size[spot];
 
-		for (j = 0; i != ios && j < size; j += io_size[i], ++i) {
+		for (j = 0; i != ios && j + io_size[i] <= size; j += io_size[i], ++i) {
 			const unsigned long long off = BYTES(offset + j);
 			const unsigned long len = BYTES(io_size[i]);
 
@@ -517,17 +548,23 @@ static int __iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
 		}
 
 		if (spots > 1) {
-			offset += size + spot_offset[spot % (spots - 1)];
+			offset += size + spot_offset[spot];
 			if (offset + spot_size[spot] >= last)
 				offset = first;
 		}
-		spot = (spot + 1) % spots;
+
+		if (++spot >= spots) {
+			ERR("Spot overflow\n");
+			spot = 0;
+			RANDOM_SHUFFLE(spot_offset, spots, unsigned long long);
+		}
 	}
 	#undef BYTES
 
 	free(spot_offset);
 	free(spot_size);
 	free(io_size);
+*/
 	return 0;
 }
 
