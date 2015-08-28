@@ -34,6 +34,8 @@ static unsigned page_size = 4096u;
 static int use_direct_io = 1;
 static int time_accurate = 0;
 
+#define BYTES(sec) ((sec) * sector_size)
+
 struct play_process {
 	unsigned long pid;
 	unsigned long rpid;
@@ -438,96 +440,49 @@ static int __iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
 	const unsigned long long first = dl->first_sector;
 	const unsigned long long last = dl->last_sector;
 
-	unsigned long *spot_size, *io_size;
-	unsigned long long *spot_offset;
-	unsigned long long offset;
-	unsigned long spot, spots = 0, ios = 0;
+	unsigned long long *io_offset;
+	unsigned long long off;
+	unsigned long i, j, ios = 0;
 
-	size_t i, j;
-
-	for (i = 0; i != SECTOR_SIZE_BITS; ++i)
-		ios += dl->io_size[i];
+	for (i = 0; i != IO_OFFSET_BITS; ++i)
+		ios += dl->io_offset[i];
 
 	if (!ios)
 		return 0;
 
-	for (i = 0; i != SECTOR_SIZE_BITS; ++i)
-		spots += dl->merged_size[i];
-
-	io_size = calloc(ios, sizeof(*io_size));
-	if (!io_size) {
+	io_offset = calloc(ios, sizeof(*io_offset));
+	if (!io_offset) {
 		ERR("Cannot allocate array of IO sizes\n");
 		return 1;
 	}
 
-	spot_size = calloc(spots, sizeof(*spot_size));
-	if (!spot_size) {
-		ERR("Cannot allocate array of spot sizes\n");
-		free(io_size);
-		return 1;
+	for (i = 0, j = 0; i != IO_OFFSET_BITS; ++i) {
+		unsigned long k;
+
+		for (k = 0; k != dl->io_offset[i]; ++k)
+			io_offset[j++] = i ? (1ull << (i - 1)) : 0;
 	}
+	RANDOM_SHUFFLE(io_offset, ios, unsigned long long);
 
-	spot_offset = calloc(spots, sizeof(*spot_offset));
-	if (!spot_offset) {
-		ERR("Cannot allocate array of spot offsets\n");
-		free(spot_size);
-		free(io_size);
-		return 1;
-	}
+	off = first;
+	for (i = 0, j = 0; i != IO_SIZE_BITS; ++i) {
+		const unsigned long size = 1ul << i;
+		unsigned long k;
 
-	for (i = 0, j = 0; i != SECTOR_SIZE_BITS; ++i) {
-		const size_t last = j + dl->io_size[i];
-		for (; j != last; ++j)
-			io_size[j] = 1ul << i;
-	}
-	RANDOM_SHUFFLE(io_size, ios, unsigned long);
+		for (k = 0; k != dl->io_size[i]; ++k) {
+			if (off + size > last)
+				off = first;
 
-	for (i = 0, j = 0; i != SECTOR_SIZE_BITS; ++i) {
-		const size_t last = j + dl->merged_size[i];
-		for (; j != last; ++j)
-			spot_size[j] = 1ul << i;
-	}
-	RANDOM_SHUFFLE(spot_size, spots, unsigned long);
-
-	for (i = 0, j = 1; i != SPOT_OFFSET_BITS; ++i) {
-		const size_t last = j + dl->spot_offset[i];
-		for (; j != last; ++j)
-			spot_offset[j] = 1ull << i;
-	}
-	RANDOM_SHUFFLE(spot_offset, spots - 1, unsigned long long);
-
-	#define BYTES(sec) ((sec) * sector_size)
-	offset = first;
-	spot = 0;
-	for (i = 0; i != ios;) {
-		const unsigned long size = spot_size[spot];
-
-		for (j = 0; i != ios && j < size; j += io_size[i], ++i) {
-			const unsigned long long off = BYTES(offset + j);
-			const unsigned long len = BYTES(io_size[i]);
-
-			iocbs[i] = iocb_get(ctx, off, len, wr);
-			if (!iocbs[i]) {
-				iocbs_release(ctx, iocbs, i);
-				free(spot_offset);
-				free(spot_size);
-				free(io_size);
+			iocbs[j] = iocb_get(ctx, BYTES(off), BYTES(size), wr);
+			if (!iocbs[j]) {
+				iocbs_release(ctx, iocbs, j);
+				free(io_offset);
 				return 1;
 			}
+			off += size + io_offset[j++];
 		}
-
-		if (spots > 1) {
-			offset += size + spot_offset[spot % (spots - 1)];
-			if (offset + spot_size[spot] >= last)
-				offset = first;
-		}
-		spot = (spot + 1) % spots;
 	}
-	#undef BYTES
-
-	free(spot_offset);
-	free(spot_size);
-	free(io_size);
+	free(io_offset);
 	return 0;
 }
 
@@ -575,6 +530,10 @@ static size_t iocbs_submit(struct process_context *ctx, struct iocb **iocbs,
 
 		if (ret < 0) {
 			ERR("Error %d, while submiting IO\n", -ret);
+			ERR("iocb offset %lld, size %lu, ptr %lx\n",
+				iocbs[sb]->u.c.offset,
+				iocbs[sb]->u.c.nbytes,
+				(unsigned long)iocbs[sb]->u.c.buf);
 			return sb;
 		}
 		sb += ret;

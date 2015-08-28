@@ -378,18 +378,17 @@ static unsigned ilog2(unsigned long long x)
 }
 
 /**
- * __account_disk_layout - account information about block size, first and
- *                         last accessed sectors, size of merged blocks and
- *                         distance between merged blocks.
+ * __account_disk_layout - gather information about IO size, first and
+ *                         last accessed sectors, distance between IOs.
+ *
+ * NOTE: events array must be sorted by sector field
  */
 static void __account_disk_layout(struct blkio_disk_layout *layout,
 			const struct blkio_event *events, size_t size)
 {
 	__u32 *ss = layout->io_size;
-	__u32 *ms = layout->merged_size;
-	__u32 *so = layout->spot_offset;
+	__u32 *so = layout->io_offset;
 	unsigned long long begin, end;
-	unsigned long long off, len;
 	size_t i;
 
 	if (!size)
@@ -399,24 +398,18 @@ static void __account_disk_layout(struct blkio_disk_layout *layout,
 	end = begin + events[0].length;
 	layout->first_sector = begin;
 	for (i = 0; i != size; ++i) {
-		off = events[i].sector;
-		len = events[i].length;
+		const unsigned long off = events[i].sector;
+		const unsigned long len = events[i].length;
 
-		assert(len && "Empty operations aren't permitted here");
+		++ss[MIN(ilog2(len), IO_SIZE_BITS - 1)];
 
-		++ss[MIN(ilog2(len), SECTOR_SIZE_BITS - 1)];
-		if (off > end) {
-			++ms[MIN(ilog2(end - begin), SECTOR_SIZE_BITS - 1)];
-			++so[MIN(ilog2(off - end), SPOT_OFFSET_BITS - 1)];
-
-			begin = off;
-			end = begin + len;
-		}
+		if (off > end)
+			++so[MIN(1 + ilog2(off - end), IO_OFFSET_BITS - 1)];
+		else
+			++so[0];
 		end = MAX(end, off + len);
 	}
-
 	layout->last_sector = end;
-	++ms[MIN(ilog2(end - begin), SECTOR_SIZE_BITS - 1)];
 }
 
 static int account_disk_layout_stats(struct blkio_stats *stats,

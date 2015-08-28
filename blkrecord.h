@@ -7,15 +7,14 @@
 #include "rbtree.h"
 #include "list.h"
 
-#define SECTOR_SIZE_BITS   16
-#define SPOT_OFFSET_BITS   64
+#define IO_SIZE_BITS       16
+#define IO_OFFSET_BITS     64
 
 struct blkio_disk_layout {
 	__u64 first_sector;
 	__u64 last_sector;
-	__u32 io_size[16];
-	__u32 merged_size[16];
-	__u32 spot_offset[64];
+	__u32 io_size[IO_SIZE_BITS];
+	__u32 io_offset[IO_OFFSET_BITS];
 };
 
 struct blkio_stats {
