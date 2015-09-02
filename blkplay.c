@@ -34,16 +34,11 @@ static unsigned page_size = 4096u;
 static int use_direct_io = 1;
 static int time_accurate = 0;
 
-#define BYTES(sec) ((sec) * sector_size)
+#define BYTES(sec)          ((sec) * sector_size)
+#define MAX_PIDS_SIZE       1024
+#define MAX_PLAY_PROCESSES  256
 
-struct play_process {
-	unsigned long pid;
-	unsigned long rpid;
-	int fd;
-};
-
-#define MAX_PIDS_SIZE 1024
-static struct play_process pids_to_play[MAX_PIDS_SIZE];
+static unsigned long pids_to_play[MAX_PIDS_SIZE];
 static unsigned pids_to_play_size;
 
 static void show_usage(const char *name)
@@ -65,6 +60,15 @@ static void show_usage(const char *name)
 		"\t-b Use buffered IO (do not use direct IO)\n";
 
 	ERR("Usage: %s %s", name, usage);
+}
+
+static int pid_compare(unsigned long lpid, unsigned long rpid)
+{
+	if (lpid < rpid)
+		return -1;
+	if (lpid > rpid)
+		return 1;
+	return 0;
 }
 
 static int parse_args(int argc, char **argv)
@@ -155,14 +159,13 @@ static int parse_args(int argc, char **argv)
 
 			found = 0;
 			for (j = 0; j != pids_to_play_size; ++j) {
-				if (pids_to_play[j].pid == (unsigned long)i) {
+				if (pids_to_play[j] == (unsigned long)i) {
 					found = 1;
 					break;
 				}
 			}
-
 			if (!found)
-				pids_to_play[pids_to_play_size++].pid = i;
+				pids_to_play[pids_to_play_size++] = i;
 			break;
 		case 't':
 			time_accurate = 1;
@@ -188,7 +191,23 @@ static int parse_args(int argc, char **argv)
 		return 1;
 	}
 
+	if (pids_to_play_size)
+		sort(pids_to_play, pids_to_play_size, &pid_compare);
+
 	return 0;
+}
+
+static int to_play(unsigned long pid)
+{
+	size_t pos;
+
+	if (!pids_to_play_size)
+		return 1;
+
+	pos = lower_bound(pids_to_play, pids_to_play_size, pid, &pid_compare);
+	if (pos == pids_to_play_size || pids_to_play[pos] != pid)
+		return 0;
+	return 1;
 }
 
 static int blkio_stats_read(int fd, struct blkio_stats *stats)
@@ -675,7 +694,6 @@ static int blkio_stats_play(struct process_context *ctx,
 		return 1;
 	}
 
-	ERR("Play %lu events\n", ios);
 	submit_i = 0;
 	while (submit_i != ios) {
 		long submit = 0, reclaim = 1;
@@ -734,16 +752,6 @@ static void play(int fd)
 	process_context_destroy(&ctx);
 }
 
-static int play_process_pid_compare(const struct play_process *l,
-			const struct play_process *r)
-{
-	if (l->pid < r->pid)
-		return -1;
-	if (l->pid > r->pid)
-		return 1;
-	return 0;
-}
-
 static unsigned long long current_time(void)
 {
 	struct timespec time;
@@ -752,7 +760,13 @@ static unsigned long long current_time(void)
 	return time.tv_sec * NS + time.tv_nsec;
 }
 
-static void __play_pids(gzFile zfd, struct play_process *pids, unsigned size)
+struct play_process {
+	unsigned long long end_time;
+	unsigned long pid;
+	int fd;
+};
+
+static void __play_pids(gzFile zfd, struct play_process *p, unsigned size)
 {
 	const unsigned long long play_time = current_time();
 
@@ -760,13 +774,10 @@ static void __play_pids(gzFile zfd, struct play_process *pids, unsigned size)
 	struct blkio_stats stats;
 
 	while (!blkio_zstats_read(zfd, &stats)) {
-		struct play_process key;
-		unsigned i;
+		const unsigned long pid = stats.pid;
+		unsigned parent;
 
-		key.pid = stats.pid;
-		i = lower_bound(pids, size, key, &play_process_pid_compare);
-
-		if (i == size || pids[i].pid != key.pid)
+		if (!to_play(pid))
 			continue;
 
 		if (record_time > stats.begin_time)
@@ -787,17 +798,46 @@ static void __play_pids(gzFile zfd, struct play_process *pids, unsigned size)
 			}
 		}
 
-		if (blkio_stats_write(pids[i].fd, &stats))
+		parent = 0;
+		if (blkio_stats_write(p[parent].fd, &stats))
 			break;
+
+		p[parent].end_time = stats.end_time;
+		while (parent < size) {
+			struct play_process tmp;
+			const size_t l = 2 * (parent + 1) - 1;
+			const size_t r = 2 * (parent + 1);
+			size_t swap = parent;
+
+			if (l < size && p[l].end_time < p[swap].end_time)
+				swap = l;
+
+			if (r < size && p[r].end_time < p[swap].end_time)
+				swap = r;
+
+			if (swap == parent)
+				break;
+
+			tmp = p[parent];
+			p[parent] = p[swap];
+			p[swap] = tmp;
+			parent = swap;
+		}
 	}	
 }
 
-static void play_pids(struct play_process *pids, unsigned size)
+static void play_pids(unsigned pool_size)
 {
+	struct play_process player[MAX_PLAY_PROCESSES];
 	unsigned i;
 	int fail = 0;
 
-	for (i = 0; i != size; ++i) {
+	for (i = 0; i != pool_size; ++i) {
+		player[i].end_time = 0;
+		player[i].fd = -1;
+	}
+
+	for (i = 0; i != pool_size; ++i) {
 		int pfds[2], ret;
 		unsigned j;
 
@@ -805,11 +845,11 @@ static void play_pids(struct play_process *pids, unsigned size)
 			perror("Cannot create pipe for play process");
 			fail = 1;
 			for (j = 0; j != i; ++j)
-				close(pids[j].fd);
+				close(player[j].fd);
 			break;
 		}
 
-		pids[i].fd = pfds[1];
+		player[i].fd = pfds[1];
 		ret = fork();
 		if (ret < 0) {
 			perror("Cannot create play process");
@@ -817,14 +857,14 @@ static void play_pids(struct play_process *pids, unsigned size)
 			close(pfds[0]);
 			close(pfds[1]);
 			for (j = 0; j != i; ++j)
-				close(pids[j].fd);
+				close(player[j].fd);
 			break;
 		}
 
-		pids[i].rpid = ret;
+		player[i].pid = ret;
 		if (!ret) {
 			for (j = 0; j != i; ++j)
-				close(pids[j].fd);
+				close(player[j].fd);
 			close(pfds[1]);
 			play(pfds[0]);
 			close(pfds[0]);
@@ -835,25 +875,26 @@ static void play_pids(struct play_process *pids, unsigned size)
 	if (!fail) {
 		gzFile zfd = gzopen(input_file_name, "rb");
 		if (zfd) {
-			sort(pids, size, &play_process_pid_compare);
 			ERR("Start playing\n");
-			__play_pids(zfd, pids, size);
-			for (i = 0; i != size; ++i)
-				close(pids[i].fd);
+			__play_pids(zfd, player, pool_size);
+			for (i = 0; i != pool_size; ++i)
+				close(player[i].fd);
 			gzclose(zfd);
 		} else {
 			ERR("Cannot allocate enough memory for zlib\n");
 		}
 	}
 
-	for (i = 0; i != size; ++i)
-		waitpid(pids[i].rpid, NULL, 0);
+	for (i = 0; i != pool_size; ++i)
+		waitpid(player[i].pid, NULL, 0);
 }
 
 static void find_and_play_pids(void)
 {
+	unsigned long long et[MAX_PLAY_PROCESSES];
+	unsigned ps = 0;
+
 	struct blkio_stats stats;
-	unsigned i;
 	gzFile zfd = 0;
 
 	zfd = gzopen(input_file_name, "rb");
@@ -864,24 +905,58 @@ static void find_and_play_pids(void)
 
 	while (!blkio_zstats_read(zfd, &stats)) {
 		const unsigned long pid = stats.pid;
-		int found = 0;
 
-		for (i = 0; i != pids_to_play_size; ++i) {
-			if (pids_to_play[i].pid == pid) {
-				found = 1;
-				break;
+		if (!to_play(pid))
+			continue;
+
+		if (!ps || et[0] > stats.begin_time) {
+			size_t child = ps++;
+
+			assert(child != MAX_PLAY_PROCESSES &&
+					"Too many play processes required");
+
+			et[child] = stats.end_time;
+			while (child != 0) {
+				const size_t parent = (child + 1) / 2 - 1;
+				unsigned long long tmp;
+
+				if (et[child] >= et[parent])
+					break;
+
+				tmp = et[parent];
+				et[parent] = et[child];
+				et[child] = tmp;
+				child = parent;
 			}
-		}
+		} else {
+			size_t parent = 0;
 
-		if (!found) {
-			assert(pids_to_play_size != MAX_PIDS_SIZE
-						&& "pids array too small");
-			pids_to_play[pids_to_play_size++].pid = pid;
+			et[parent] = stats.end_time;
+			while (parent < ps) {
+				unsigned long long tmp;
+				const size_t l = 2 * (parent + 1) - 1;
+				const size_t r = 2 * (parent + 1);
+				size_t swap = parent;
+
+				if (l < ps && et[l] < et[swap])
+					swap = l;
+
+				if (r < ps && et[r] < et[swap])
+					swap = r;
+
+				if (swap == parent)
+					break;
+
+				tmp = et[parent];
+				et[parent] = et[swap];
+				et[swap] = tmp;
+				parent = swap;
+			}
 		}
 	}
 
 	gzclose(zfd);
-	play_pids(pids_to_play, pids_to_play_size);
+	play_pids(ps);
 }
 
 int main(int argc, char **argv)
@@ -890,10 +965,7 @@ int main(int argc, char **argv)
 		return 1;
 
 	srand(time(NULL));
-	if (pids_to_play_size)
-		play_pids(pids_to_play, pids_to_play_size);
-	else
-		find_and_play_pids();
+	find_and_play_pids();
 
 	return 0;
 }
