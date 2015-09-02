@@ -26,6 +26,7 @@ struct blkio_stats {
 	__u32 iodepth;
 	__u32 batch;
 	__u32 pid;
+	__u32 cpu;
 	struct blkio_disk_layout reads_layout;
 	struct blkio_disk_layout writes_layout;
 };
@@ -36,6 +37,7 @@ struct blkio_event {
 	unsigned long length;
 	unsigned long action;
 	unsigned long pid;
+	unsigned long cpu;
 };
 
 struct blkio_queue_node {
@@ -46,7 +48,7 @@ struct blkio_queue_node {
 struct process_info {
 	struct list_head head;
 	struct blkio_event *events;
-	unsigned long size, capacity, pid;
+	unsigned long size, capacity, pid, cpu;
 };
 
 struct blkio_queue {

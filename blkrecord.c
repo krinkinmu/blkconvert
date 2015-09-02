@@ -23,10 +23,10 @@ static const char *input_file_name;
 static const char *output_file_name;
 static unsigned min_time_interval = 1000u;
 static unsigned sector_size = 512u;
-static int binary = 1, use_compression = 0;
-static int per_process = 0;
+static int binary = 1;
+static int per_process = 0, per_cpu = 0;
 
-static volatile int done = 0;
+static volatile sig_atomic_t done = 0;
 
 static void show_usage(const char *name)
 {
@@ -35,16 +35,16 @@ static void show_usage(const char *name)
 		"[-o <output file>   | --output=<output file>]\n" \
 		"[-i <time interval> | --interval=<time interval>]\n" \
 		"[-s <sector size>   | --sector=<sector size>]\n" \
-		"[-c                 | --compress]\n" \
+		"[-c                 | --per-cpu]\n" \
 		"[-t                 | --text]\n" \
 		"[-p                 | --per-process]\n" \
 		"\t-f Use specified blktrace file. Default: stdin\n" \
 		"\t-o Ouput file. Default: stdout\n" \
 		"\t-i Minimum sampling time interval in ms. Default: 1000\n" \
 		"\t-s Sector size. Default: 512\n" \
-		"\t-c Compress output data using zlib. Default: disabled\n" \
+		"\t-c Gather per CPU stats.\n" \
 		"\t-t Output in text format, by default output is binary.\n" \
-		"\t-p Use per process stats.\n";
+		"\t-p Gather per process stats.\n";
 
 	ERR("Usage: %s %s", name, usage);		
 }
@@ -77,7 +77,7 @@ static int parse_args(int argc, char **argv)
 			.val = 's'
 		},
 		{
-			.name = "compress",
+			.name = "per-cpu",
 			.has_arg = no_argument,
 			.flag = NULL,
 			.val = 'c'
@@ -128,7 +128,7 @@ static int parse_args(int argc, char **argv)
 			sector_size = i;
 			break;
 		case 'c':
-			use_compression = 1;
+			per_cpu = 1;
 			break;
 		case 't':
 			binary = 0;
@@ -161,6 +161,7 @@ static int blk_io_trace_to_cpu(struct blk_io_trace *trace)
 	trace->action = __bswap_32(trace->action);
 	trace->pdu_len = __bswap_16(trace->pdu_len);
 	trace->pid = __bswap_32(trace->pid);
+	trace->cpu = __bswap_32(trace->cpu);
 	/* Other fields aren't interesting so far */
 	return 0;
 }
@@ -199,6 +200,7 @@ static int blkio_event_read(struct blkio_queue *q, struct blkio_event *event)
 	event->length = (trace.bytes + sector_size - 1) / sector_size;
 	event->action = trace.action;
 	event->pid = per_process ? trace.pid : 0;
+	event->cpu = per_cpu ? trace.cpu : 0;
 	return 0;
 }
 
@@ -267,14 +269,6 @@ static int mygzwrite(gzFile zfd, const char *buf, size_t size)
 	return 0;
 }
 
-static int blkio_queue_write(struct blkio_queue *q, const char *data,
-			size_t size)
-{
-	if (q->zofd)
-		return mygzwrite(q->zofd, data, size);
-	return mywrite(q->ofd, data, size);
-}
-
 static int blkio_stats_dump(struct blkio_queue *q, const struct blkio_stats *st)
 {
 	unsigned long long first = ~0ull, last = 0ull;
@@ -284,7 +278,7 @@ static int blkio_stats_dump(struct blkio_queue *q, const struct blkio_stats *st)
 		return 0;
 
 	if (binary)
-		return blkio_queue_write(q, (const char *)st, sizeof(*st));
+		return mygzwrite(q->zofd, (const char *)st, sizeof(*st));
 
 	if (st->reads) {
 		first = MIN(first, st->reads_layout.first_sector);
@@ -296,11 +290,12 @@ static int blkio_stats_dump(struct blkio_queue *q, const struct blkio_stats *st)
 		last = MAX(last, st->writes_layout.last_sector);
 	}
 
-	snprintf(buffer, 512, "pid=%lu begin=%llu end=%llu "
+	snprintf(buffer, 512, "pid=%lu cpu=%lu begin=%llu end=%llu "
 				"inversions=%llu reads=%lu writes=%lu "
 				"avg_iodepth=%lu avg_batch=%lu "
 				"first_sec=%llu last_sec=%llu\n",
 				(unsigned long)st->pid,
+				(unsigned long)st->cpu,
 				(unsigned long long)st->begin_time,
 				(unsigned long long)st->end_time,
 				(unsigned long long)st->inversions,
@@ -310,7 +305,7 @@ static int blkio_stats_dump(struct blkio_queue *q, const struct blkio_stats *st)
 				(unsigned long)st->batch,
 				first, last);
 
-	return blkio_queue_write(q, buffer, strlen(buffer));
+	return mywrite(q->ofd, buffer, strlen(buffer));
 }
 
 /**
@@ -505,6 +500,7 @@ static int account_events(struct blkio_queue *q,
 
 	memset(&stats, 0, sizeof(stats));
 	stats.pid = events->pid;
+	stats.cpu = events->cpu;
 
 	if (account_general_stats(&stats, events, size))
 		return 1;
@@ -700,7 +696,7 @@ static void blkio_event_handle_queue(struct blkio_queue *queue,
 		struct process_info *pi;
 
 		pi = list_entry(pos, struct process_info, head);
-		if (pi->pid == event->pid) {
+		if (pi->pid == event->pid && pi->cpu == event->cpu) {
 			process_info_append(pi, event);
 			found = 1;
 			break;
@@ -715,6 +711,7 @@ static void blkio_event_handle_queue(struct blkio_queue *queue,
 			return;
 		}
 		pi->pid = event->pid;
+		pi->cpu = event->cpu;
 		list_link_before(head, &pi->head);
 		process_info_append(pi, event);
 	}
@@ -821,7 +818,7 @@ int main(int argc, char **argv)
 
 	}
 
-	if (use_compression) {
+	if (binary) {
 		zofd = gzdopen(ofd, "wb");
 
 		if (!zofd) {
