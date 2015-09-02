@@ -1,7 +1,7 @@
 [global]
 ioengine=libaio
 iodepth=16
-size=512m
+size=4G
 bs=512
 numjobs=1
 filename=/dev/sdb
