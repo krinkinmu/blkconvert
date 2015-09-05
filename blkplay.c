@@ -11,6 +11,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -209,12 +211,6 @@ static int to_play(unsigned long pid)
 		return 0;
 	return 1;
 }
-
-static int blkio_stats_read(int fd, struct blkio_stats *stats)
-{ return myread(fd, (char *)stats, sizeof(*stats)); }
-
-static int blkio_stats_write(int fd, const struct blkio_stats *stats)
-{ return mywrite(fd, (char *)stats, sizeof(*stats)); }
 
 static int blkio_zstats_read(gzFile zfd, struct blkio_stats *stats)
 {
@@ -735,7 +731,52 @@ static int blkio_stats_play(struct process_context *ctx,
 	return rc;
 }
 
-static void play(int fd)
+struct play_process {
+	unsigned long long end_time;
+	unsigned long pid, ppid;
+	int queue;
+};
+
+struct play_message {
+	long type;
+        char text[sizeof(struct blkio_stats)];
+};
+
+static int send(const struct play_process *p, const struct blkio_stats *s)
+{
+	struct play_message msg;
+	long type;
+
+	msg.type = p->pid;
+	memcpy(msg.text, s, sizeof(*s));
+
+	if (msgsnd(p->queue, &msg, sizeof(*s), 0) == -1) {
+		if (errno != EIDRM)
+			perror("blkio_stats send failed");
+		return 1;
+	}
+	if (msgrcv(p->queue, &type, 0, p->ppid, MSG_NOERROR) == -1) {
+		if (errno != EIDRM)
+			perror("blkio_stats send noack");
+		return 1;
+	}
+	return 0;
+}
+
+static int receive(const struct play_process *p, struct blkio_stats *s)
+{
+	struct play_message msg;
+	const long type = p->ppid;
+
+	if (msgrcv(p->queue, &msg, sizeof(*s), p->pid, 0) == -1)
+		return 1;
+	memcpy(s, msg.text, sizeof(*s));
+	if (msgsnd(p->queue, &type, 0, 0) == -1)
+		return 1;
+	return 0;
+}
+
+static void play(const struct play_process *p)
 {
 	struct process_context ctx;
 	struct blkio_stats stats;
@@ -745,7 +786,7 @@ static void play(int fd)
 		return;
 	}
 
-	while (!blkio_stats_read(fd, &stats)) {
+	while (!receive(p, &stats)) {
 		if (blkio_stats_play(&ctx, &stats))
 			break;
 	}
@@ -759,12 +800,6 @@ static unsigned long long current_time(void)
 	clock_gettime(CLOCK_MONOTONIC, &time);
 	return time.tv_sec * NS + time.tv_nsec;
 }
-
-struct play_process {
-	unsigned long long end_time;
-	unsigned long pid;
-	int fd;
-};
 
 static void __play_pids(gzFile zfd, struct play_process *p, unsigned size)
 {
@@ -799,7 +834,7 @@ static void __play_pids(gzFile zfd, struct play_process *p, unsigned size)
 		}
 
 		parent = 0;
-		if (blkio_stats_write(p[parent].fd, &stats))
+		if (send(&p[parent], &stats))
 			break;
 
 		p[parent].end_time = stats.end_time;
@@ -829,45 +864,36 @@ static void __play_pids(gzFile zfd, struct play_process *p, unsigned size)
 static void play_pids(unsigned pool_size)
 {
 	struct play_process player[MAX_PLAY_PROCESSES];
+	const long pid = getpid();
+	int msgqid;
 	unsigned i;
 	int fail = 0;
 
-	for (i = 0; i != pool_size; ++i) {
-		player[i].end_time = 0;
-		player[i].fd = -1;
+	msgqid = msgget(ftok("/tmp/blkplay", 'P'), IPC_CREAT);
+	if (msgqid == -1) {
+		perror("Cannot create message queue");
+		return;
 	}
 
 	for (i = 0; i != pool_size; ++i) {
-		int pfds[2], ret;
-		unsigned j;
+		player[i].end_time = 0;
+		player[i].queue = msgqid;
+		player[i].ppid = pid;
+	}
 
-		if (pipe(pfds)) {
-			perror("Cannot create pipe for play process");
-			fail = 1;
-			for (j = 0; j != i; ++j)
-				close(player[j].fd);
-			break;
-		}
+	for (i = 0; i != pool_size; ++i) {
+		int ret = fork();
 
-		player[i].fd = pfds[1];
-		ret = fork();
 		if (ret < 0) {
 			perror("Cannot create play process");
 			fail = 1;
-			close(pfds[0]);
-			close(pfds[1]);
-			for (j = 0; j != i; ++j)
-				close(player[j].fd);
 			break;
 		}
 
 		player[i].pid = ret;
 		if (!ret) {
-			for (j = 0; j != i; ++j)
-				close(player[j].fd);
-			close(pfds[1]);
-			play(pfds[0]);
-			close(pfds[0]);
+			player[i].pid = getpid();
+			play(&player[i]);
 			return;
 		}
 	}
@@ -877,14 +903,13 @@ static void play_pids(unsigned pool_size)
 		if (zfd) {
 			ERR("Start playing\n");
 			__play_pids(zfd, player, pool_size);
-			for (i = 0; i != pool_size; ++i)
-				close(player[i].fd);
 			gzclose(zfd);
 		} else {
 			ERR("Cannot allocate enough memory for zlib\n");
 		}
 	}
 
+	msgctl(msgqid, IPC_RMID, 0);
 	for (i = 0; i != pool_size; ++i)
 		waitpid(player[i].pid, NULL, 0);
 }
