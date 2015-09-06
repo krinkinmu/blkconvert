@@ -678,6 +678,7 @@ static int blkio_stats_play(struct process_context *ctx,
 	const long ios = stat->reads + stat->writes;
 	const long iodepth = MIN(stat->iodepth, ctx->size);
 	const long batch = MIN(iodepth, stat->batch);
+	const long long q2q = (stat->end_time - stat->begin_time) / ios; 
 
 	struct iocb **iocbs;
 	long submit_i;
@@ -715,6 +716,13 @@ static int blkio_stats_play(struct process_context *ctx,
 		if (ctx->running > iodepth - next)
 			reclaim = ctx->running - iodepth + next;
 
+		if (time_accurate) {
+			struct timespec wait;
+
+			wait.tv_sec = (q2q * submitted) / NS;
+			wait.tv_nsec = (q2q * submitted) % NS;
+			nanosleep(&wait, 0);
+		}
 		reclaimed = io_getevents(ctx->io_ctx, reclaim, ctx->size,
 					ctx->events, NULL);
 		if (reclaimed < 0) {
