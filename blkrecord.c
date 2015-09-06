@@ -206,14 +206,18 @@ static int blkio_event_read(struct blkio_queue *q, struct blkio_event *event)
 
 static int is_queue_event(const struct blkio_event *event)
 {
-	return ((event->action & 0xFFFF) == __BLK_TA_QUEUE) &&
-		(event->action & BLK_TC_ACT(BLK_TC_QUEUE));
+	const unsigned action = event->action & 0xFFFF;
+
+	return ((event->action & BLK_TC_ACT(BLK_TC_QUEUE)) &&
+		(action == __BLK_TA_BACKMERGE ||
+		action == __BLK_TA_FRONTMERGE ||
+		action == __BLK_TA_INSERT));
 }
 
 static int is_complete_event(const struct blkio_event *event)
 {
-	return ((event->action & 0xFFFF) == __BLK_TA_COMPLETE) &&
-		(event->action & BLK_TC_ACT(BLK_TC_COMPLETE));
+	return ((event->action & 0xFFFF) == __BLK_TA_ISSUE) &&
+		(event->action & BLK_TC_ACT(BLK_TC_ISSUE));
 }
 
 static int is_write_event(const struct blkio_event *event)
