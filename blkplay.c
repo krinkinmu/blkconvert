@@ -409,7 +409,7 @@ static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 	struct iocb_ctree *nodes;
 	size_t i;
 
-	nodes = calloc(size, sizeof(struct iocb_ctree));
+	nodes = calloc(size, sizeof(*nodes));
 	if (!nodes) {
 		ERR("Cannot allocate cartesian tree nodes\n");
 		return 1;
@@ -423,13 +423,8 @@ static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 
 	for (i = 0; i != size; ++i) {
 		const unsigned long long rem = size - i - 1;
-		const unsigned long long min = max_invs(rem) < invs
+		const unsigned long long idx = max_invs(rem) < invs
 					? invs - max_invs(rem) : 0;
-		const unsigned long long max = MIN(invs, rem);
-		const unsigned long long idx = myrandom(min, max + 1);
-
-		assert(min <= max && "Wrong inversions limits");
-		assert(idx <= max && idx >= min && "Wrong item index");
 
 		iocbs[i] = iocb_ctree_extract(&tree, idx)->iocb;
 		invs -= idx;
@@ -485,7 +480,7 @@ static int __iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
 
 	off = first;
 	for (i = 0, j = 0; i != IO_SIZE_BITS; ++i) {
-		const unsigned long size = 1ul << i;
+		const unsigned long size = i + 1;
 		unsigned long k;
 
 		for (k = 0; k != dl->io_size[i]; ++k) {
@@ -678,7 +673,7 @@ static int blkio_stats_play(struct process_context *ctx,
 	const long ios = stat->reads + stat->writes;
 	const long iodepth = MIN(stat->iodepth, ctx->size);
 	const long batch = MIN(iodepth, stat->batch);
-	const long long q2q = (stat->end_time - stat->begin_time) / ios; 
+//	const long long q2q = (stat->end_time - stat->begin_time) / ios; 
 
 	struct iocb **iocbs;
 	long submit_i;
@@ -715,7 +710,7 @@ static int blkio_stats_play(struct process_context *ctx,
 		next = MIN(ios - submit_i, batch);
 		if (ctx->running > iodepth - next)
 			reclaim = ctx->running - iodepth + next;
-
+/*
 		if (time_accurate) {
 			struct timespec wait;
 
@@ -723,6 +718,7 @@ static int blkio_stats_play(struct process_context *ctx,
 			wait.tv_nsec = (q2q * submitted) % NS;
 			nanosleep(&wait, 0);
 		}
+*/
 		reclaimed = io_getevents(ctx->io_ctx, reclaim, ctx->size,
 					ctx->events, NULL);
 		if (reclaimed < 0) {

@@ -206,7 +206,7 @@ static int blkio_event_read(struct blkio_queue *q, struct blkio_event *event)
 
 static int is_queue_event(const struct blkio_event *event)
 {
-	const unsigned action = event->action & 0xFFFF;
+	const unsigned action = event->action & 0xFFFFu;
 
 	return ((event->action & BLK_TC_ACT(BLK_TC_QUEUE)) &&
 		(action == __BLK_TA_BACKMERGE ||
@@ -216,7 +216,7 @@ static int is_queue_event(const struct blkio_event *event)
 
 static int is_complete_event(const struct blkio_event *event)
 {
-	return ((event->action & 0xFFFF) == __BLK_TA_ISSUE) &&
+	return ((event->action & 0xFFFFu) == __BLK_TA_ISSUE) &&
 		(event->action & BLK_TC_ACT(BLK_TC_ISSUE));
 }
 
@@ -397,15 +397,14 @@ static void __account_disk_layout(struct blkio_disk_layout *layout,
 	end = begin + events[0].length;
 	layout->first_sector = begin;
 	for (i = 0; i != size; ++i) {
-		const unsigned long off = events[i].sector;
+		const unsigned long long off = events[i].sector;
 		const unsigned long len = events[i].length;
-
-		++ss[MIN(ilog2(len), IO_SIZE_BITS - 1)];
 
 		if (off > end)
 			++so[MIN(1 + ilog2(off - end), IO_OFFSET_BITS - 1)];
 		else
 			++so[0];
+		++ss[MIN(len, IO_SIZE_BITS) - 1];
 		end = MAX(end, off + len);
 	}
 	layout->last_sector = end;
@@ -751,7 +750,8 @@ static void blkio_event_handle_complete(struct blkio_queue *queue,
 
 			pi = list_entry(pos, struct process_info, head);
 			if (pi->pid == node->event.pid &&
-					node->event.time >= pi->events->time) {
+			    pi->cpu == node->event.cpu &&
+			    node->event.time >= pi->events->time) {
 				process_info_append(pi, event);
 				break;
 			}

@@ -7,7 +7,7 @@
 #include "rbtree.h"
 #include "list.h"
 
-#define IO_SIZE_BITS       16
+#define IO_SIZE_BITS       256
 #define IO_OFFSET_BITS     64
 
 struct blkio_disk_layout {
