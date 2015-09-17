@@ -25,16 +25,17 @@
 #include "debug.h"
 
 static const unsigned long long NS = 1000000000ull;
+static const unsigned sector_size = 512u;
 
 static const char *input_file_name;
 static const char *device_file_name;
 static unsigned number_of_events = 512u;
-static unsigned sector_size = 512u;
 static unsigned page_size = 4096u;
 static int use_direct_io = 1;
 static int time_accurate = 0;
 
-#define BYTES(sec)          ((sec) * sector_size)
+#define BYTES(sectors)      ((sectors) * sector_size)
+#define SECTORS(bytes)      (((bytes) + sector_size - 1)/sector_size)
 #define MAX_PIDS_SIZE       1024
 #define MAX_PLAY_PROCESSES  256
 
@@ -93,12 +94,6 @@ static int parse_args(int argc, char **argv)
 			.val = 'e'
 		},
 		{
-			.name = "sector",
-			.has_arg = required_argument,
-			.flag = NULL,
-			.val = 's'
-		},
-		{
 			.name = "pid",
 			.has_arg = required_argument,
 			.flag = NULL,
@@ -120,7 +115,7 @@ static int parse_args(int argc, char **argv)
 			.name = NULL
 		}
 	};
-	static const char *opts = "d:f:e:s:p:tb";
+	static const char *opts = "d:f:e:p:tb";
 
 	unsigned j;
 	long i;
@@ -141,14 +136,6 @@ static int parse_args(int argc, char **argv)
 				return 1;
 			}
 			number_of_events = (unsigned)i;
-			break;
-		case 's':
-			i = atol(optarg);
-			if (i <= 0) {
-				ERR("Sector size must be positive\n");
-				return 1;
-			}
-			sector_size = (unsigned)i;
 			break;
 		case 'p':
 			i = atol(optarg);
@@ -347,13 +334,13 @@ static void iocbs_sort_by_offset(struct iocb **iocbs, size_t size)
  */
 struct iocb_ctree {
 	struct ctree link;
-	struct iocb *iocb;
+	unsigned long first, last;
 };
 
-static void iocb_ctree_node_init(struct iocb_ctree *tree, struct iocb *iocb)
+static void iocb_ctree_node_init(struct iocb_ctree *tree, unsigned long idx)
 {
 	cinit(&tree->link);
-	tree->iocb = iocb;
+	tree->first = tree->last = idx;
 }
 
 /**
@@ -405,9 +392,10 @@ static unsigned long long max_invs(unsigned long long items)
 static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 			unsigned long long invs)
 {
+	struct iocb **copy;
 	struct ctree *tree = 0;
 	struct iocb_ctree *nodes;
-	size_t i;
+	size_t i, j, k;
 
 	nodes = calloc(size, sizeof(*nodes));
 	if (!nodes) {
@@ -415,20 +403,46 @@ static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 		return 1;
 	}
 
-	iocbs_sort_by_offset(iocbs, size);
-	for (i = 0; i != size; ++i) {
-		iocb_ctree_node_init(nodes + i, iocbs[i]);
-		iocb_ctree_append(&tree, nodes + i);
+	copy = calloc(size, sizeof(*copy));
+	if (!copy) {
+		ERR("Cannot allocate array for iocbs copy\n");
+		free(nodes);
+		return 1;
 	}
 
-	for (i = 0; i != size; ++i) {
-		const unsigned long long rem = size - i - 1;
-		const unsigned long long idx = max_invs(rem) < invs
-					? invs - max_invs(rem) : 0;
+	memcpy(copy, iocbs, size * sizeof(*iocbs));
+	iocbs_sort_by_offset(copy, size);
 
-		iocbs[i] = iocb_ctree_extract(&tree, idx)->iocb;
+	iocb_ctree_node_init(nodes, 0);
+	iocb_ctree_append(&tree, nodes);
+	for (i = 1, j = 1; i != size; ++i) {
+		const unsigned long long poff = copy[i - 1]->u.c.offset;
+		const unsigned long long plen = copy[i - 1]->u.c.nbytes;
+		const unsigned long long off = copy[i]->u.c.offset;
+
+		if (poff <= off && poff + plen >= off) {
+			nodes[j - 1].last = i;
+		} else {	
+			iocb_ctree_node_init(nodes + j, i);
+			iocb_ctree_append(&tree, nodes + j++);
+		}
+	}
+
+	for (i = 0, k = 0; i != j; ++i) {
+		struct iocb_ctree *node;
+		unsigned long pos;
+
+		const unsigned long long rem = j - i - 1;
+		const unsigned long idx = max_invs(rem) < invs
+					? MIN(rem, invs - max_invs(rem)) : 0;
+
+		node = iocb_ctree_extract(&tree, idx);
 		invs -= idx;
+
+		for (pos = node->first; pos <= node->last; ++pos)
+			iocbs[k++] = copy[pos];
 	}
+	free(copy);
 	free(nodes);
 	return 0;
 }
