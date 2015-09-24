@@ -19,10 +19,11 @@
 #include "common.h"
 #include "debug.h"
 
+static const unsigned sector_size = 512u;
+
 static const char *input_file_name;
 static const char *output_file_name;
 static unsigned min_time_interval = 1000u;
-static unsigned sector_size = 512u;
 static int binary = 1;
 static int per_process = 0, per_cpu = 0;
 
@@ -71,12 +72,6 @@ static int parse_args(int argc, char **argv)
 			.val = 'i'
 		},
 		{
-			.name = "sector",
-			.has_arg = required_argument,
-			.flag = NULL,
-			.val = 's'
-		},
-		{
 			.name = "per-cpu",
 			.has_arg = no_argument,
 			.flag = NULL,
@@ -98,7 +93,7 @@ static int parse_args(int argc, char **argv)
 			.name = NULL
 		}
 	};
-	static const char *opts = "f:o:i:s:ctp";
+	static const char *opts = "f:o:i:ctp";
 
 	long i;
 	int c;
@@ -118,14 +113,6 @@ static int parse_args(int argc, char **argv)
 				return 1;
 			}
 			min_time_interval = i;
-			break;
-		case 's':
-			i = atol(optarg);
-			if (i <= 0) {
-				ERR("Sector size must be positive\n");
-				return 1;
-			}
-			sector_size = i;
 			break;
 		case 'c':
 			per_cpu = 1;
@@ -197,7 +184,7 @@ static int blkio_event_read(struct blkio_queue *q, struct blkio_event *event)
 
 	event->time = trace.time;
 	event->sector = trace.sector;
-	event->length = (trace.bytes + sector_size - 1) / sector_size;
+	event->length = trace.bytes / sector_size;
 	event->action = trace.action;
 	event->pid = per_process ? trace.pid : 0;
 	event->cpu = per_cpu ? trace.cpu : 0;
@@ -209,9 +196,7 @@ static int is_queue_event(const struct blkio_event *event)
 	const unsigned action = event->action & 0xFFFFu;
 
 	return ((event->action & BLK_TC_ACT(BLK_TC_QUEUE)) &&
-		(action == __BLK_TA_BACKMERGE ||
-		action == __BLK_TA_FRONTMERGE ||
-		action == __BLK_TA_INSERT));
+		action == __BLK_TA_QUEUE);
 }
 
 static int is_complete_event(const struct blkio_event *event)
@@ -419,7 +404,7 @@ static void __account_disk_layout(struct blkio_disk_layout *layout,
 			++so[MIN(1 + ilog2(off - end), IO_OFFSET_BITS - 1)];
 		else
 			++so[0];
-		++ss[MIN(len, IO_SIZE_BITS) - 1];
+		++ss[MIN(ilog2(len), IO_SIZE_BITS - 1)];
 		end = MAX(end, off + len);
 	}
 	layout->last_sector = end;

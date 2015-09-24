@@ -432,15 +432,16 @@ static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 		struct iocb_ctree *node;
 		unsigned long pos;
 
-		const unsigned long long rem = j - i - 1;
-		const unsigned long idx = max_invs(rem) < invs
-					? MIN(rem, invs - max_invs(rem)) : 0;
+		const unsigned long long max = j - i - 1;
+		const unsigned long min = max_invs(max) < invs
+					? MIN(max, invs - max_invs(max)) : 0;
+		const unsigned long idx = myrandom(min, max + 1);
 
 		node = iocb_ctree_extract(&tree, idx);
 		invs -= idx;
 
-		for (pos = node->first; pos <= node->last; ++pos)
-			iocbs[k++] = copy[pos];
+		for (pos = node->first; pos <= node->last;)
+			iocbs[k++] = copy[pos++];
 	}
 	free(copy);
 	free(nodes);
@@ -494,7 +495,7 @@ static int __iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
 
 	off = first;
 	for (i = 0, j = 0; i != IO_SIZE_BITS; ++i) {
-		const unsigned long size = i + 1;
+		const unsigned long size = 1ul << i;
 		unsigned long k;
 
 		for (k = 0; k != dl->io_size[i]; ++k) {
@@ -687,7 +688,6 @@ static int blkio_stats_play(struct process_context *ctx,
 	const long ios = stat->reads + stat->writes;
 	const long iodepth = MIN(stat->iodepth, ctx->size);
 	const long batch = MIN(iodepth, stat->batch);
-//	const long long q2q = (stat->end_time - stat->begin_time) / ios; 
 
 	struct iocb **iocbs;
 	long submit_i;
@@ -724,15 +724,6 @@ static int blkio_stats_play(struct process_context *ctx,
 		next = MIN(ios - submit_i, batch);
 		if (ctx->running > iodepth - next)
 			reclaim = ctx->running - iodepth + next;
-/*
-		if (time_accurate) {
-			struct timespec wait;
-
-			wait.tv_sec = (q2q * submitted) / NS;
-			wait.tv_nsec = (q2q * submitted) % NS;
-			nanosleep(&wait, 0);
-		}
-*/
 		reclaimed = io_getevents(ctx->io_ctx, reclaim, ctx->size,
 					ctx->events, NULL);
 		if (reclaimed < 0) {
