@@ -10,7 +10,7 @@ COMMON_SRC := algorithm.c object_cache.c file_io.c ctree.c list.c rbtree.c
 COMMON_DEP := $(COMMON_SRC:.c=.d)
 COMMON_OBJ := $(COMMON_SRC:.c=.o)
 
-BLKRECORD_SRC := blkrecord.c
+BLKRECORD_SRC := blkrecord.c blkqueue.c
 BLKRECORD_DEP := $(BLKRECORD_SRC:.c=.d)
 BLKRECORD_OBJ := $(BLKRECORD_SRC:.c=.o)
 

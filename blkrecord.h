@@ -4,7 +4,7 @@
 #include <asm/types.h>
 #include <zlib.h>
 
-#include "rbtree.h"
+#include "blkqueue.h"
 #include "list.h"
 
 #define IO_SIZE_BITS       16
@@ -31,18 +31,22 @@ struct blkio_stats {
 	struct blkio_disk_layout writes_layout;
 };
 
+#define WRITE_BIT  0
+#define WRITE_MASK (1 << WRITE_BIT)
+
+#define QUEUE_BIT  1
+#define QUEUE_MASK (1 << QUEUE_BIT)
+
+#define IS_WRITE(type) ((type) & WRITE_MASK)
+#define IS_QUEUE(type) ((type) & QUEUE_MASK)
+
 struct blkio_event {
 	unsigned long long time;
-	unsigned long long sector;
-	unsigned long length;
-	unsigned long action;
+	unsigned long long from;
+	unsigned long long to;
 	unsigned long pid;
 	unsigned long cpu;
-};
-
-struct blkio_queue_node {
-	struct rb_node rb_node;
-	struct blkio_event event;
+	unsigned char type;
 };
 
 struct process_info {
@@ -51,17 +55,31 @@ struct process_info {
 	unsigned long size, capacity, pid, cpu;
 };
 
-struct blkio_queue {
+static inline struct process_info *PROCESS_INFO(struct list_head *head)
+{
+	if (!head)
+		return 0;
+	return list_entry(head, struct process_info, head);
+}
+
+struct blkio_record_context {
 	struct list_head head;
-	struct rb_root rb_root;
+	struct blkio_queue read, write;
 	gzFile zofd;
 	int ifd, ofd;
 };
 
-static inline void blkio_queue_init(struct blkio_queue *queue)
+static inline void blkio_record_context_init(struct blkio_record_context *ctx)
 {
-	list_head_init(&queue->head);
-	queue->rb_root.rb_node = NULL;
+	list_head_init(&ctx->head);
+	blkio_queue_init(&ctx->read);
+	blkio_queue_init(&ctx->write);
+}
+
+static inline void blkio_record_context_finit(struct blkio_record_context *ctx)
+{
+	blkio_queue_finit(&ctx->read);
+	blkio_queue_finit(&ctx->write);
 }
 
 #endif /*__BLKRECORD_H__*/
