@@ -3,12 +3,12 @@
 #include "object_cache.h"
 #include "common.h"
 #include "debug.h"
-#include "list.h"
 
-struct object_cache {
-	struct list_head head;
-	size_t object_size;
-};
+void object_cache_init(struct object_cache *cache, size_t object_size)
+{
+	cache->object_size = MAX(object_size, sizeof(struct list_head));
+	list_head_init(&cache->head);
+}
 
 struct object_cache *object_cache_create(size_t object_size)
 {
@@ -19,12 +19,11 @@ struct object_cache *object_cache_create(size_t object_size)
 		return 0;
 	}
 
-	cache->object_size = MAX(object_size, sizeof(struct list_head));
-	list_head_init(&cache->head);
+	object_cache_init(cache, object_size);
 	return cache;
 }
 
-void object_cache_destroy(struct object_cache *cache)
+void object_cache_finit(struct object_cache *cache)
 {
 	while (!list_empty(&cache->head)) {
 		struct list_head *head = cache->head.next;
@@ -32,6 +31,11 @@ void object_cache_destroy(struct object_cache *cache)
 		list_unlink(head);
 		free(head);
 	}
+}
+
+void object_cache_destroy(struct object_cache *cache)
+{
+	object_cache_finit(cache);
 	free(cache);
 }
 
