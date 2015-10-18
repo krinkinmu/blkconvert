@@ -23,7 +23,7 @@
 # Use is subject to license terms.
 #
 
-set $dir=/media/kmu/0845609c-3bab-4a80-84b3-8907977cd858
+set $dir=/home/kmu/ws/blkconvert/test/mnt
 set $nfiles=50000
 set $meandirwidth=100
 set $meanfilesize=16k
