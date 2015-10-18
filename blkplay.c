@@ -229,22 +229,14 @@ static int blkio_zstats_read(gzFile zfd, struct blkio_stats *stats)
 	return 0;
 }
 
-static unsigned mylog2(unsigned long long x)
+static unsigned long myrandom(unsigned long from, unsigned long to)
 {
-	unsigned bits;
-	for (bits = 0; x; x >>= 1)
-		++bits;
-	return bits;
-}
+	static const unsigned bits = 8;
 
-static unsigned long long myrandom(unsigned long long from,
-			unsigned long long to)
-{
-	const unsigned bits = mylog2(RAND_MAX);
 	unsigned long long value = 0;
 	unsigned gen;
 
-	for (gen = 0; gen < sizeof(value) * 8; gen += bits)
+	for (gen = 0; gen < sizeof(value) * bits; gen += bits)
 		value |= (unsigned long long)rand() << gen;
 	return value % (to - from) + from;
 }
@@ -334,13 +326,13 @@ static void iocbs_sort_by_offset(struct iocb **iocbs, size_t size)
  */
 struct iocb_ctree {
 	struct ctree link;
-	unsigned long first, last;
+	struct iocb *iocb;
 };
 
-static void iocb_ctree_node_init(struct iocb_ctree *tree, unsigned long idx)
+static void iocb_ctree_node_init(struct iocb_ctree *tree, struct iocb *iocb)
 {
 	cinit(&tree->link);
-	tree->first = tree->last = idx;
+	tree->iocb = iocb;
 }
 
 /**
@@ -392,58 +384,31 @@ static unsigned long long max_invs(unsigned long long items)
 static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 			unsigned long long invs)
 {
-	struct iocb **copy;
 	struct ctree *tree = 0;
 	struct iocb_ctree *nodes;
-	size_t i, j, k;
+	size_t i;
 
 	nodes = calloc(size, sizeof(*nodes));
 	if (!nodes) {
 		ERR("Cannot allocate cartesian tree nodes\n");
 		return 1;
 	}
+	iocbs_sort_by_offset(iocbs, size);
 
-	copy = calloc(size, sizeof(*copy));
-	if (!copy) {
-		ERR("Cannot allocate array for iocbs copy\n");
-		free(nodes);
-		return 1;
+	for (i = 0; i != size; ++i) {
+		iocb_ctree_node_init(nodes + i, iocbs[i]);
+		iocb_ctree_append(&tree, nodes + i);
 	}
 
-	memcpy(copy, iocbs, size * sizeof(*iocbs));
-	iocbs_sort_by_offset(copy, size);
-
-	iocb_ctree_node_init(nodes, 0);
-	iocb_ctree_append(&tree, nodes);
-	for (i = 1, j = 1; i != size; ++i) {
-		const unsigned long long poff = copy[i - 1]->u.c.offset;
-		const unsigned long long plen = copy[i - 1]->u.c.nbytes;
-		const unsigned long long off = copy[i]->u.c.offset;
-
-		if (poff <= off && poff + plen >= off) {
-			nodes[j - 1].last = i;
-		} else {	
-			iocb_ctree_node_init(nodes + j, i);
-			iocb_ctree_append(&tree, nodes + j++);
-		}
-	}
-
-	for (i = 0, k = 0; i != j; ++i) {
-		struct iocb_ctree *node;
-		unsigned long pos;
-
-		const unsigned long long max = j - i - 1;
+	for (i = 0; i != size; ++i) {
+		const unsigned long max = size - i - 1;
 		const unsigned long min = max_invs(max) < invs
 					? MIN(max, invs - max_invs(max)) : 0;
 		const unsigned long idx = myrandom(min, max + 1);
 
-		node = iocb_ctree_extract(&tree, idx);
+		iocbs[i] = iocb_ctree_extract(&tree, idx)->iocb;
 		invs -= idx;
-
-		for (pos = node->first; pos <= node->last;)
-			iocbs[k++] = copy[pos++];
 	}
-	free(copy);
 	free(nodes);
 	return 0;
 }
