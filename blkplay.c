@@ -6,15 +6,18 @@
 #include <errno.h>
 #include <time.h>
 
-#include <libaio.h>
-
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 #include <zlib.h>
+
+#include "usio.h"
 
 #include "object_cache.h"
 #include "algorithm.h"
@@ -250,8 +253,8 @@ static unsigned long long myrandom(unsigned long long from,
 }
 
 struct process_context {
-	io_context_t io_ctx;
-	struct io_event *events;
+	int io_ctx;
+	struct usio_event *events;
 	long size, running;
 	int fd;
 	struct object_cache *cache;
@@ -260,20 +263,21 @@ struct process_context {
 /**
  * struct iocb management routines (cached allocation and release mostly).
  */
-static struct iocb *iocb_alloc(struct object_cache *cache)
+static struct usio_io *iocb_alloc(struct object_cache *cache)
 {
 	return object_cache_alloc(cache);
 }
 
-static void iocb_free(struct object_cache *cache, struct iocb *iocb)
+static void iocb_free(struct object_cache *cache, struct usio_io *iocb)
 {
 	object_cache_free(cache, iocb);
 }
 
-static struct iocb *iocb_get(struct process_context *ctx,
-			unsigned long long off, unsigned long len, int rw)
+static struct usio_io *iocb_get(struct process_context *ctx,
+			unsigned long long off, unsigned long len,
+			unsigned long flags)
 {
-	struct iocb *iocb;
+	struct usio_io *iocb;
 	void *buf;
 
 	if (!(iocb = iocb_alloc(ctx->cache))) {
@@ -287,23 +291,25 @@ static struct iocb *iocb_get(struct process_context *ctx,
 		return 0;
 	}
 
-	if (rw) {
-		io_prep_pwrite(iocb, ctx->fd, buf, len, off);
+	if (flags & 1)
 		memset(buf, 0x13, len);
-	} else {
-		io_prep_pread(iocb, ctx->fd, buf, len, off);
-	}
+
+	iocb->data = (unsigned long)buf;
+	iocb->bytes = len;
+	iocb->offset = off;
+	iocb->flags = flags;
+	iocb->fd = ctx->fd;
 
 	return iocb;
 }
 
-static void iocb_release(struct process_context *ctx, struct iocb *iocb)
+static void iocb_release(struct process_context *ctx, struct usio_io *iocb)
 {
-	free(iocb->u.c.buf);
+	free((void *)iocb->data);
 	iocb_free(ctx->cache, iocb);
 }
 
-static void iocbs_release(struct process_context *ctx, struct iocb **iocbs,
+static void iocbs_release(struct process_context *ctx, struct usio_io **iocbs,
 			size_t count)
 {
 	size_t i;
@@ -312,11 +318,12 @@ static void iocbs_release(struct process_context *ctx, struct iocb **iocbs,
 }
 
 
-static int iocb_offset_compare(const struct iocb **l, const struct iocb **r)
+static int iocb_offset_compare(const struct usio_io **l,
+			const struct usio_io **r)
 {
-	if ((*l)->u.c.offset < (*r)->u.c.offset)
+	if ((*l)->offset < (*r)->offset)
 		return -1;
-	if ((*l)->u.c.offset > (*r)->u.c.offset)
+	if ((*l)->offset > (*r)->offset)
 		return 1;
 	return 0;
 }
@@ -324,7 +331,7 @@ static int iocb_offset_compare(const struct iocb **l, const struct iocb **r)
 /**
  * iocbs_sort - sorts iocbs pointers by offset in ascending order
  */
-static void iocbs_sort_by_offset(struct iocb **iocbs, size_t size)
+static void iocbs_sort_by_offset(struct usio_io **iocbs, size_t size)
 { sort(iocbs, size, &iocb_offset_compare); }
 
 
@@ -389,10 +396,10 @@ static unsigned long long max_invs(unsigned long long items)
  *       because iocbs can contain items with same offset, even
  *       though permutation contains exactly invs inversions.
  */
-static int iocbs_shuffle(struct iocb **iocbs, size_t size,
+static int iocbs_shuffle(struct usio_io **iocbs, size_t size,
 			unsigned long long invs)
 {
-	struct iocb **copy;
+	struct usio_io **copy;
 	struct ctree *tree = 0;
 	struct iocb_ctree *nodes;
 	size_t i, j, k;
@@ -416,9 +423,9 @@ static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 	iocb_ctree_node_init(nodes, 0);
 	iocb_ctree_append(&tree, nodes);
 	for (i = 1, j = 1; i != size; ++i) {
-		const unsigned long long poff = copy[i - 1]->u.c.offset;
-		const unsigned long long plen = copy[i - 1]->u.c.nbytes;
-		const unsigned long long off = copy[i]->u.c.offset;
+		const unsigned long long poff = copy[i - 1]->offset;
+		const unsigned long long plen = copy[i - 1]->bytes;
+		const unsigned long long off = copy[i]->offset;
 
 		if (poff <= off && poff + plen >= off) {
 			nodes[j - 1].last = i;
@@ -463,8 +470,8 @@ static int iocbs_shuffle(struct iocb **iocbs, size_t size,
 		} \
 	} while (0)
 
-static int __iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
-			int wr, const struct blkio_disk_layout *dl)
+static int __iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
+			unsigned long flags, const struct blkio_disk_layout *dl)
 {
 	const unsigned long long first = dl->first_sector;
 	const unsigned long long last = dl->last_sector;
@@ -502,7 +509,8 @@ static int __iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
 			if (off + size > last)
 				off = first;
 
-			iocbs[j] = iocb_get(ctx, BYTES(off), BYTES(size), wr);
+			iocbs[j] = iocb_get(ctx, BYTES(off), BYTES(size),
+						flags);
 			if (!iocbs[j]) {
 				iocbs_release(ctx, iocbs, j);
 				free(io_offset);
@@ -524,7 +532,7 @@ static int __iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
  * fd - file descriptor to work with
  * stat - IO parameters.
  */
-static int iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
+static int iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
 			const struct blkio_stats *stat)
 {
 	const unsigned long reads = stat->reads;
@@ -549,25 +557,41 @@ static int iocbs_fill(struct iocb **iocbs, struct process_context *ctx,
  * Returns number of submitted IOs, if returned value less then count,
  * then error occured.
  */
-static size_t iocbs_submit(struct process_context *ctx, struct iocb **iocbs,
+static size_t iocbs_submit(struct process_context *ctx, struct usio_io **iocbs,
 			size_t count)
 {
 	size_t sb = 0;
 
 	while (sb != count) {
-		const int ret = io_submit(ctx->io_ctx, count - sb, iocbs + sb);
+		struct usio_ios req;
+		int ret;
 
+		req.count = count - sb;
+		req.ios = iocbs + sb;
+
+		ret = ioctl(ctx->io_ctx, USIO_SUBMIT, &req);
 		if (ret < 0) {
 			ERR("Error %d, while submiting IO\n", -ret);
 			ERR("iocb offset %lld, size %lu, ptr %lx\n",
-				iocbs[sb]->u.c.offset,
-				iocbs[sb]->u.c.nbytes,
-				(unsigned long)iocbs[sb]->u.c.buf);
+				iocbs[sb]->offset,
+				(unsigned long)iocbs[sb]->bytes,
+				(unsigned long)iocbs[sb]->data);
 			return sb;
 		}
 		sb += ret;
 	}
 	return sb;
+}
+
+static long iocbs_reclaim(struct process_context *ctx, long count)
+{
+	struct usio_events events;
+
+	events.min_count = MIN(count, ctx->size);
+	events.max_count = ctx->size;
+	events.events = ctx->events;
+
+	return ioctl(ctx->io_ctx, USIO_RECLAIM, &events);
 }
 
 /**
@@ -583,18 +607,16 @@ static int io_events_check_and_release(struct process_context *ctx,
 	int ret = 0;
 
 	for (i = 0; i != count; ++i) {
-		struct io_event *e = ctx->events + i;
-		struct iocb *iocb = e->obj;
+		struct usio_event *e = ctx->events + i;
+		struct usio_io *iocb = (struct usio_io *)e->io;
 
-		if (e->res != iocb->u.c.nbytes) {
-			const char *op = iocb->aio_lio_opcode == IO_CMD_PREAD
-						? "read" : "write";
-			ERR("AIO %s of %ld bytes at %lld failed (%ld/%ld)\n",
+		if (e->res) {
+			const char *op = (iocb->flags & 1) ? "write" : "read";
+			ERR("AIO %s of %ld bytes at %ld failed (%ld)\n",
 						op,
-						iocb->u.c.nbytes,
-						iocb->u.c.offset,
-						e->res,
-						e->res2);
+						(unsigned long)iocb->bytes,
+						(unsigned long)iocb->offset,
+						(unsigned long)e->res);
 			ret = 1;
 		}
 		iocb_release(ctx, iocb);
@@ -619,9 +641,6 @@ static int open_disk_file(void)
 
 static int process_context_setup(struct process_context *ctx)
 {
-	int ret;
-
-	ctx->io_ctx = 0;
 	ctx->size = number_of_events;
 	ctx->running = 0;
 	ctx->fd = open_disk_file();
@@ -629,14 +648,14 @@ static int process_context_setup(struct process_context *ctx)
 	if (ctx->fd < 0)
 		return 1;
 
-	ctx->cache = object_cache_create(sizeof(struct iocb));
+	ctx->cache = object_cache_create(sizeof(struct usio_io));
 	if (!ctx->cache) {
 		ERR("Cannot create iocb cache\n");
 		close(ctx->fd);
 		return 1;
 	}
 
-	ctx->events = calloc(number_of_events, sizeof(struct io_event));
+	ctx->events = calloc(number_of_events, sizeof(struct usio_event));
 	if (!ctx->events) {
 		ERR("Cannot allocate array of io_event\n");
 		object_cache_destroy(ctx->cache);
@@ -644,8 +663,9 @@ static int process_context_setup(struct process_context *ctx)
 		return 1;
 	}
 
-	if ((ret = io_setup(number_of_events, &ctx->io_ctx))) {
-		ERR("Cannot initialize AIO context (%d)\n", -ret);
+	ctx->io_ctx = open("/dev/usio", O_RDWR);
+	if (ctx->io_ctx < 0) {
+		ERR("Cannot initialize AIO context (%d)\n", errno);
 		free(ctx->events);
 		object_cache_destroy(ctx->cache);
 		close(ctx->fd);
@@ -658,16 +678,15 @@ static int process_context_setup(struct process_context *ctx)
 static void process_context_destroy(struct process_context *ctx)
 {
 	if (ctx->running) {
-		const int ret = io_getevents(ctx->io_ctx, ctx->running,
-					ctx->size, ctx->events, NULL);
+		const long ret = iocbs_reclaim(ctx, ctx->running);
 
 		if (ret < 0)
-			ERR("Error %d, while reclaiming IO\n", -ret);
+			ERR("Error %d, while reclaiming IO\n", errno);
 		else
 			io_events_check_and_release(ctx, ret);
 	}
 
-	io_destroy(ctx->io_ctx);
+	close(ctx->io_ctx);
 	free(ctx->events);
 	object_cache_destroy(ctx->cache);
 	close(ctx->fd);
@@ -689,11 +708,11 @@ static int blkio_stats_play(struct process_context *ctx,
 	const long iodepth = MIN(stat->iodepth, ctx->size);
 	const long batch = MIN(iodepth, stat->batch);
 
-	struct iocb **iocbs;
+	struct usio_io **iocbs;
 	long submit_i;
 	int rc = 0;
 
-	iocbs = calloc(ios, sizeof(struct iocb *));
+	iocbs = calloc(ios, sizeof(*iocbs));
 	if (!iocbs) {
 		ERR("Cannot allocate array of struct iocb\n");
 		return 1;
@@ -724,8 +743,7 @@ static int blkio_stats_play(struct process_context *ctx,
 		next = MIN(ios - submit_i, batch);
 		if (ctx->running > iodepth - next)
 			reclaim = ctx->running - iodepth + next;
-		reclaimed = io_getevents(ctx->io_ctx, reclaim, ctx->size,
-					ctx->events, NULL);
+		reclaimed = iocbs_reclaim(ctx, reclaim);
 		if (reclaimed < 0) {
 			ERR("Error %ld, while reclaiming IO\n", -reclaimed);
 			rc = 1;
