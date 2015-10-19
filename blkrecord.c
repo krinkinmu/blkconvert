@@ -198,6 +198,11 @@ static int blk_io_trace_write_event(const struct blk_io_trace *trace)
 	return (trace->action & BLK_TC_ACT(BLK_TC_WRITE)) != 0;
 }
 
+static int blk_io_trace_sync_event(const struct blk_io_trace *trace)
+{
+	return (trace->action & BLK_TC_ACT(BLK_TC_SYNC)) != 0;
+}
+
 static int blk_io_trace_accept_event(const struct blk_io_trace *trace)
 {
 	if (!trace->bytes)
@@ -215,6 +220,8 @@ static unsigned char blk_io_trace_type(const struct blk_io_trace *trace)
 		type |= QUEUE_MASK;
 	if (blk_io_trace_write_event(trace))
 		type |= WRITE_MASK;
+	if (blk_io_trace_sync_event(trace))
+		type |= SYNC_MASK;
 	return type;
 }
 
@@ -403,6 +410,10 @@ static void __account_disk_layout(struct blkio_disk_layout *layout,
 			++so[MIN(1 + ilog2(off - end), IO_OFFSET_BITS - 1)];
 		else
 			++so[0];
+
+		if (IS_SYNC(events[i].type))
+			++layout->sync;
+
 		++ss[MIN(ilog2(len), IO_SIZE_BITS - 1)];
 		end = MAX(end, off + len);
 	}

@@ -471,7 +471,7 @@ static int iocbs_shuffle(struct usio_io **iocbs, size_t size,
 	} while (0)
 
 static int __iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
-			unsigned long flags, const struct blkio_disk_layout *dl)
+			int wr, const struct blkio_disk_layout *dl)
 {
 	const unsigned long long first = dl->first_sector;
 	const unsigned long long last = dl->last_sector;
@@ -479,6 +479,7 @@ static int __iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
 	unsigned long long *io_offset;
 	unsigned long long off;
 	unsigned long i, j, ios = 0;
+	unsigned long *io_flags;
 
 	for (i = 0; i != IO_OFFSET_BITS; ++i)
 		ios += dl->io_offset[i];
@@ -492,6 +493,13 @@ static int __iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
 		return 1;
 	}
 
+	io_flags = calloc(ios, sizeof(*io_flags));
+	if (!io_flags) {
+		ERR("Cannot allocate flags array\n");
+		free(io_offset);
+		return 1;
+	}
+
 	for (i = 0, j = 0; i != IO_OFFSET_BITS; ++i) {
 		unsigned long k;
 
@@ -499,6 +507,12 @@ static int __iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
 			io_offset[j++] = i ? (1ull << (i - 1)) : 0;
 	}
 	RANDOM_SHUFFLE(io_offset, ios, unsigned long long);
+
+	for (i = 0; i != ios; ++i)
+		io_flags[i] = (wr ? 1ul : 0ul);
+	for (i = 0; i != dl->sync; ++i)
+		io_flags[i] |= (1ul << 4) | (1ul << 10);
+	RANDOM_SHUFFLE(io_flags, ios, unsigned long);
 
 	off = first;
 	for (i = 0, j = 0; i != IO_SIZE_BITS; ++i) {
@@ -510,15 +524,17 @@ static int __iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
 				off = first;
 
 			iocbs[j] = iocb_get(ctx, BYTES(off), BYTES(size),
-						flags);
+						io_flags[j]);
 			if (!iocbs[j]) {
 				iocbs_release(ctx, iocbs, j);
+				free(io_flags);
 				free(io_offset);
 				return 1;
 			}
 			off += size + io_offset[j++];
 		}
 	}
+	free(io_flags);
 	free(io_offset);
 	return 0;
 }

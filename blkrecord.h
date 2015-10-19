@@ -13,6 +13,7 @@
 struct blkio_disk_layout {
 	__u64 first_sector;
 	__u64 last_sector;
+	__u32 sync;
 	__u32 io_size[IO_SIZE_BITS];
 	__u32 io_offset[IO_OFFSET_BITS];
 };
@@ -37,8 +38,12 @@ struct blkio_stats {
 #define QUEUE_BIT  1
 #define QUEUE_MASK (1 << QUEUE_BIT)
 
+#define SYNC_BIT   2
+#define SYNC_MASK  (1 << SYNC_BIT)
+
 #define IS_WRITE(type) ((type) & WRITE_MASK)
 #define IS_QUEUE(type) ((type) & QUEUE_MASK)
+#define IS_SYNC(type)  ((type) & SYNC_MASK)
 
 struct blkio_event {
 	unsigned long long time;
