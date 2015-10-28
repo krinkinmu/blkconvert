@@ -36,6 +36,7 @@ static unsigned number_of_events = 512u;
 static unsigned page_size = 4096u;
 static int use_direct_io = 1;
 static int time_accurate = 0;
+static int keep_io_delay = 0;
 
 #define BYTES(sectors)      ((sectors) * sector_size)
 #define SECTORS(bytes)      (((bytes) + sector_size - 1)/sector_size)
@@ -53,6 +54,7 @@ static void show_usage(const char *name)
 		"[-e <number of events> | --events=<number of events>]\n" \
 		"[-s <sector size>      | --sector=<sector size>]\n" \
 		"[-p <pid>              | --pid=<pid>]\n" \
+		"[-i                    | --keep_io_delay]\n" \
 		"[-t                    | --time]\n" \
 		"[-b                    | --buffered]\n" \
 		"\t-d Block device file. Must be specified.\n" \
@@ -60,6 +62,7 @@ static void show_usage(const char *name)
 		"\t-e Max number of concurrently processing events. Default: 512\n" \
 		"\t-s Block device sector size. Default: 512\n" \
 		"\t-p Process PID to play.\n" \
+		"\t-i Keep time interval between IO.\n" \
 		"\t-t Time accurate playing.\n" \
 		"\t-b Use buffered IO (do not use direct IO)\n";
 
@@ -103,6 +106,12 @@ static int parse_args(int argc, char **argv)
 			.val = 'p'
 		},
 		{
+			.name = "keep_io_delay",
+			.has_arg = no_argument,
+			.flag = NULL,
+			.val = 'i'
+		},
+		{
 			.name = "time",
 			.has_arg = no_argument,
 			.flag = NULL,
@@ -118,7 +127,7 @@ static int parse_args(int argc, char **argv)
 			.name = NULL
 		}
 	};
-	static const char *opts = "d:f:e:p:tb";
+	static const char *opts = "d:f:e:p:itb";
 
 	unsigned j;
 	long i;
@@ -156,6 +165,9 @@ static int parse_args(int argc, char **argv)
 			}
 			if (!found)
 				pids_to_play[pids_to_play_size++] = i;
+			break;
+		case 'i':
+			keep_io_delay = 1;
 			break;
 		case 't':
 			time_accurate = 1;
@@ -232,24 +244,29 @@ static int blkio_zstats_read(gzFile zfd, struct blkio_stats *stats)
 	return 0;
 }
 
-static unsigned mylog2(unsigned long long x)
+static unsigned long myrandom(unsigned long from, unsigned long to)
 {
-	unsigned bits;
-	for (bits = 0; x; x >>= 1)
-		++bits;
-	return bits;
-}
-
-static unsigned long long myrandom(unsigned long long from,
-			unsigned long long to)
-{
-	const unsigned bits = mylog2(RAND_MAX);
+	const unsigned bits = 15;
 	unsigned long long value = 0;
 	unsigned gen;
 
 	for (gen = 0; gen < sizeof(value) * 8; gen += bits)
-		value |= (unsigned long long)rand() << gen;
+		value |= (unsigned long)rand() << gen;
 	return value % (to - from) + from;
+}
+
+static void delay(unsigned long long ns)
+{
+	struct timespec wait;
+
+	if (!ns)
+		return;
+
+	if (ns < NS) wait.tv_sec = 0;
+	else wait.tv_sec = ns / NS;
+
+	wait.tv_nsec = ns % NS;
+	nanosleep(&wait, 0);
 }
 
 struct process_context {
@@ -333,7 +350,6 @@ static int iocb_offset_compare(const struct usio_io **l,
  */
 static void iocbs_sort_by_offset(struct usio_io **iocbs, size_t size)
 { sort(iocbs, size, &iocb_offset_compare); }
-
 
 /**
  * We use implicit cartesian tree instead mere array, because we need
@@ -681,7 +697,7 @@ static int process_context_setup(struct process_context *ctx)
 
 	ctx->io_ctx = open("/dev/usio", O_RDWR);
 	if (ctx->io_ctx < 0) {
-		ERR("Cannot initialize AIO context (%d)\n", errno);
+		ERR("Cannot open /dev/usio (%d)\n", errno);
 		free(ctx->events);
 		object_cache_destroy(ctx->cache);
 		close(ctx->fd);
@@ -724,9 +740,13 @@ static int blkio_stats_play(struct process_context *ctx,
 	const long iodepth = MIN(stat->iodepth, ctx->size);
 	const long batch = MIN(iodepth, stat->batch);
 
+	unsigned long long wait = 0;
 	struct usio_io **iocbs;
 	long submit_i;
 	int rc = 0;
+
+	if (keep_io_delay && ios > 1)
+		wait = (stat->end_time - stat->begin_time) / (ios - 1);
 
 	iocbs = calloc(ios, sizeof(*iocbs));
 	if (!iocbs) {
@@ -750,6 +770,9 @@ static int blkio_stats_play(struct process_context *ctx,
 		submitted = iocbs_submit(ctx, iocbs + submit_i, submit);
 		submit_i += submitted;
 		ctx->running += submitted;
+
+		if (keep_io_delay)
+			delay(submitted * wait);
 
 		if (submitted < submit) {
 			rc = 1;
@@ -832,13 +855,8 @@ static void __play_pids(gzFile zfd, struct play_process *p, unsigned size)
 			const unsigned long long r_elapsed =
 						stats.begin_time - record_time;
 
-			if (p_elapsed < r_elapsed) {
-				struct timespec wait;
-
-				wait.tv_sec = (r_elapsed - p_elapsed) / NS;
-				wait.tv_nsec = (r_elapsed - p_elapsed) % NS;
-				nanosleep(&wait, 0);
-			}
+			if (r_elapsed > p_elapsed)
+				delay(r_elapsed - p_elapsed);
 		}
 
 		parent = 0;
