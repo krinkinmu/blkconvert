@@ -189,8 +189,8 @@ static int blk_io_trace_queue_event(const struct blk_io_trace *trace)
 
 static int blk_io_trace_complete_event(const struct blk_io_trace *trace)
 {
-	return ((trace->action & 0xFFFFu) == __BLK_TA_ISSUE) &&
-		(trace->action & BLK_TC_ACT(BLK_TC_ISSUE));
+	return ((trace->action & 0xFFFFu) == __BLK_TA_COMPLETE) &&
+		(trace->action & BLK_TC_ACT(BLK_TC_COMPLETE));
 }
 
 static int blk_io_trace_write_event(const struct blk_io_trace *trace)
@@ -504,40 +504,46 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 static int account_general_stats(struct blkio_stats *stats,
 			const struct blkio_event *events, size_t size)
 {
-	unsigned long total_iodepth = 0, iodepth = 0;
+	static unsigned long long BURST_TIME = 1000000ull;
+	static unsigned long BURST_MAX_SIZE = 1024ul;
+
 	unsigned long long begin = ~0ull, end = 0;
-	unsigned long reads = 0, writes = 0, rw_bursts = 0;
+	unsigned long long burst_end_time = 0, total_iodepth = 0;
+	unsigned long reads = 0, writes = 0, queues;
+	unsigned long burst = 0, bursts = 0;
+	unsigned long iodepth = 0;
 	size_t i;
 
 	for (i = 0; i != size; ++i) {
+		if (burst == BURST_MAX_SIZE || burst_end_time < events[i].time)
+			burst = 0;
+
 		if (IS_QUEUE(events[i].type)) {
-			if (IS_WRITE(events[i].type))
-				++writes;
-			else
-				++reads;
-			++iodepth;
+			if (IS_WRITE(events[i].type)) ++writes;
+			else ++reads;
+
+			if (!burst) {
+				burst_end_time = events[i].time + BURST_TIME;
+				++bursts;
+			}
+
+			total_iodepth += ++iodepth;
+			++burst;
+
 			begin = MIN(begin, events[i].time);
 			end = MAX(end, events[i].time);
 		} else {
-			if (i && IS_QUEUE(events[i - 1].type)) {
-				total_iodepth += iodepth;
-				++rw_bursts;
-			}
 			if (iodepth)
 				--iodepth;
 		}
 	}
 
-	if (reads + writes == 0)
+	queues = reads + writes;
+	if (!queues)
 		return 0;
 
-	if (IS_QUEUE(events[i - 1].type)) {
-		total_iodepth += iodepth;
-		++rw_bursts;
-	}
-
-	stats->batch = (reads + writes + rw_bursts - 1) / rw_bursts;
-	stats->iodepth = MAX(1, (total_iodepth + rw_bursts - 1) / rw_bursts);
+	stats->batch = (queues + bursts - 1) / bursts;
+	stats->iodepth = (total_iodepth + queues - 1) / queues;
 	stats->begin_time = begin;
 	stats->end_time = end;
 	stats->reads = reads;
@@ -747,8 +753,7 @@ static void blkio_event_handle_complete(struct blkio_record_context *ctx,
 		for (; pos != head; pos = pos->next) {
 			struct process_info *pi = PROCESS_INFO(pos);
 
-			if (pi->pid == event->pid && pi->cpu == event->cpu &&
-			    pi->events->time <= event->time) {
+			if (pi->pid == queue->pid && pi->cpu == queue->cpu) {
 				process_info_append(pi, event);
 				break;
 			}
@@ -768,7 +773,7 @@ static void blkio_event_handle(struct blkio_record_context *ctx,
 
 static void blkrecord(struct blkio_record_context *ctx)
 {
-	unsigned long events_total = 0;
+	unsigned long events_total = 0, queues = 0;
 	struct blk_io_trace trace;
 
 	while (!done && !blk_io_trace_read(ctx, &trace)) {
@@ -784,11 +789,17 @@ static void blkrecord(struct blkio_record_context *ctx)
 		event.cpu = per_cpu ? trace.cpu : 0;
 		event.type = blk_io_trace_type(&trace);
 
+
+		if (IS_QUEUE(event.type))
+			++queues;
+
 		blkio_event_handle(ctx, &event);
 		++events_total;
 	}
 	blkio_record_context_dump(ctx, ~0ull);
 	ERR("total events processed: %lu\n", events_total);
+	ERR("queues: %lu\n", queues);
+	ERR("completes: %lu\n", events_total - queues);
 }
 
 static void handle_signal(int sig)
