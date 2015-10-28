@@ -189,8 +189,8 @@ static int blk_io_trace_queue_event(const struct blk_io_trace *trace)
 
 static int blk_io_trace_complete_event(const struct blk_io_trace *trace)
 {
-	return ((trace->action & 0xFFFFu) == __BLK_TA_ISSUE) &&
-		(trace->action & BLK_TC_ACT(BLK_TC_ISSUE));
+	return ((trace->action & 0xFFFFu) == __BLK_TA_COMPLETE) &&
+		(trace->action & BLK_TC_ACT(BLK_TC_COMPLETE));
 }
 
 static int blk_io_trace_write_event(const struct blk_io_trace *trace)
