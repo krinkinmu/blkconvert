@@ -1,0 +1,12 @@
+[global]
+ioengine=libaio
+iodepth=32
+direct=1
+size=1G
+bs=4k
+timeout=60
+numjobs=1
+filename=/dev/sdb
+norandommap
+[job]
+rw=read
