@@ -451,6 +451,7 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 {
 	struct blkio_event *buf = calloc(size, sizeof(*events));
 	struct blkio_run *runs;
+	unsigned long total_seq, max_seq;
 	size_t total;
 	size_t i, j, k;
 
@@ -473,7 +474,17 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 			continue;
 		memcpy(buf + j++, e, sizeof(*buf));
 	}
+
 	total = fill_runs(buf, j, runs);
+	total_seq = max_seq = 0;
+	for (i = 0; i != total; ++i) {
+		const unsigned long seq = (runs[i].last - runs[i].first) + 1;
+
+		total_seq += seq;
+		max_seq = MAX(max_seq, seq);
+	}
+	stats->avg_seq = total_seq / total;
+	stats->max_seq = max_seq;
 	stats->inversions = __ci_merge_sort(runs, total, runs + total);
 
 	for (i = 0, j = 0; i != size; ++i) {

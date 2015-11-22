@@ -26,6 +26,8 @@ struct blkio_stats {
 	__u32 writes;
 	__u32 iodepth;
 	__u32 batch;
+	__u32 avg_seq;
+	__u32 max_seq;
 	__u32 pid;
 	__u32 cpu;
 	struct blkio_disk_layout reads_layout;
