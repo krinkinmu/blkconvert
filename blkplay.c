@@ -396,6 +396,30 @@ static struct iocb_ctree *iocb_ctree_extract(struct ctree **tree,
 	return centry(node, struct iocb_ctree, link);
 }
 
+static unsigned long fill_runs(struct usio_io **ios, size_t size,
+			struct iocb_ctree *nodes, unsigned long seq)
+{
+	unsigned long count;
+	size_t i, len;
+
+	iocb_ctree_node_init(nodes, 0);
+	len = 1;
+	for (i = 1, count = 1; i != size; ++i) {
+		const unsigned long long poff = ios[i - 1]->offset;
+		const unsigned long long plen = ios[i - 1]->bytes;
+		const unsigned long long off = ios[i]->offset;
+
+		if (poff <= off && poff + plen >= off && count < seq) {
+			nodes[count - 1].last = i;
+			++len;
+		} else {
+			iocb_ctree_node_init(nodes + count++, i);
+			len = 1;
+		}
+	}
+	return count;
+}
+
 static unsigned long long max_invs(unsigned long long items)
 { return items * (items - 1) / 2; }
 
@@ -415,12 +439,14 @@ static unsigned long long max_invs(unsigned long long items)
  *       though permutation contains exactly invs inversions.
  */
 static int iocbs_shuffle(struct usio_io **iocbs, size_t size,
-			unsigned long long invs, unsigned long seq)
+			const struct blkio_stats *stat)
 {
+	unsigned long long invs = stat->inversions;
+	unsigned long l, r, target;
 	struct usio_io **copy;
 	struct ctree *tree = 0;
 	struct iocb_ctree *nodes;
-	size_t i, j, k, count;
+	size_t i, j, count;
 
 	nodes = calloc(size, sizeof(*nodes));
 	if (!nodes) {
@@ -438,29 +464,29 @@ static int iocbs_shuffle(struct usio_io **iocbs, size_t size,
 	memcpy(copy, iocbs, size * sizeof(*iocbs));
 	iocbs_sort_by_offset(copy, size);
 
-	iocb_ctree_node_init(nodes, 0);
-	iocb_ctree_append(&tree, nodes);
-	count = 1;
-	for (i = 1, j = 1; i != size; ++i) {
-		const unsigned long long poff = copy[i - 1]->offset;
-		const unsigned long long plen = copy[i - 1]->bytes;
-		const unsigned long long off = copy[i]->offset;
+	l = stat->avg_seq;
+	r = stat->max_seq;
+	target = size / l;
+	count = fill_runs(copy, size, nodes, l);
 
-		if (poff <= off && poff + plen >= off && count < seq) {
-			nodes[j - 1].last = i;
-			++count;
-		} else {	
-			iocb_ctree_node_init(nodes + j, i);
-			iocb_ctree_append(&tree, nodes + j++);
-			count = 1;
-		}
+	while (l < r) {
+		const unsigned long m = l + (r - l) / 2;
+
+		count = fill_runs(copy, size, nodes, m);
+		if (count < target)
+			l = m + 1;
+		else
+			r = m;
 	}
 
-	for (i = 0, k = 0; i != j; ++i) {
+	for (i = 0; i != count; ++i)
+		iocb_ctree_append(&tree, nodes + i);
+
+	for (i = 0, j = 0; i != count; ++i) {
 		struct iocb_ctree *node;
 		unsigned long pos;
 
-		const unsigned long long max = j - i - 1;
+		const unsigned long long max = count - i - 1;
 		const unsigned long min = max_invs(max) < invs
 					? MIN(max, invs - max_invs(max)) : 0;
 		const unsigned long idx = myrandom(min, max + 1);
@@ -469,7 +495,7 @@ static int iocbs_shuffle(struct usio_io **iocbs, size_t size,
 		invs -= idx;
 
 		for (pos = node->first; pos <= node->last;)
-			iocbs[k++] = copy[pos++];
+			iocbs[j++] = copy[pos++];
 	}
 	free(copy);
 	free(nodes);
@@ -581,8 +607,7 @@ static int iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
 	if (__iocbs_fill(iocbs + reads, ctx, 1, &stat->writes_layout))
 		return 1;
 
-	return iocbs_shuffle(iocbs, reads + writes, stat->inversions,
-		stat->avg_seq + (stat->max_seq - stat->avg_seq) / 4);
+	return iocbs_shuffle(iocbs, reads + writes, stat);
 }
 
 /**
