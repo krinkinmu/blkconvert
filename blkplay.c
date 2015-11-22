@@ -246,12 +246,14 @@ static int blkio_zstats_read(gzFile zfd, struct blkio_stats *stats)
 
 static unsigned long myrandom(unsigned long from, unsigned long to)
 {
-	const unsigned bits = 15;
-	unsigned long long value = 0;
+	const unsigned long bits = 15;
+	const unsigned long mask = (1ul << bits) - 1;
+
+	unsigned long value = 0;
 	unsigned gen;
 
 	for (gen = 0; gen < sizeof(value) * 8; gen += bits)
-		value |= (unsigned long)rand() << gen;
+		value |= ((unsigned long)rand() & mask) << gen;
 	return value % (to - from) + from;
 }
 
