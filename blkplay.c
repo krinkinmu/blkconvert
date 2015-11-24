@@ -466,8 +466,7 @@ static int iocbs_shuffle(struct usio_io **iocbs, size_t size,
 
 	l = stat->avg_seq;
 	r = stat->max_seq;
-	target = size / l;
-	count = fill_runs(copy, size, nodes, l);
+	target = (size + l - 1) / l;
 
 	while (l < r) {
 		const unsigned long m = l + (r - l) / 2;
@@ -478,6 +477,7 @@ static int iocbs_shuffle(struct usio_io **iocbs, size_t size,
 		else
 			r = m;
 	}
+	count = fill_runs(copy, size, nodes, l);
 
 	for (i = 0; i != count; ++i)
 		iocb_ctree_append(&tree, nodes + i);
