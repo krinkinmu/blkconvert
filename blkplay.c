@@ -409,7 +409,7 @@ static unsigned long fill_runs(struct usio_io **ios, size_t size,
 		const unsigned long long plen = ios[i - 1]->bytes;
 		const unsigned long long off = ios[i]->offset;
 
-		if (poff <= off && poff + plen >= off && count < seq) {
+		if (poff <= off && poff + plen >= off && len < seq) {
 			nodes[count - 1].last = i;
 			++len;
 		} else {
