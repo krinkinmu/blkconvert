@@ -318,6 +318,19 @@ static int blkio_run_offset_compare(const struct blkio_run *l,
 	return 0;
 }
 
+static int blkio_run_time_compare(const struct blkio_run *l,
+			const struct blkio_run *r)
+{
+	if (l->last->time < r->first->time)
+		return -1;
+	if (l->first->time > r->last->time)
+		return 1;
+	return 0;
+}
+
+static void blkio_runs_sort_by_time(struct blkio_run *events, size_t size)
+{ sort(events, size, &blkio_run_time_compare); }
+
 /**
  * __ci_merge - merges two sorted arrays and count number of
  *              inversions. Place result in buf array, so it
@@ -377,6 +390,7 @@ static unsigned long long __ci_merge_sort(struct blkio_run *events,
 static unsigned ilog2(unsigned long long x)
 {
 	unsigned power = 0;
+
 	while (x >>= 1)
 		++power;
 	return power;
@@ -432,7 +446,6 @@ static size_t fill_runs(const struct blkio_event *events, size_t size,
 	for (i = 1; i != size; ++i) {
 		const unsigned long long pbeg = events[i - 1].from;
 		const unsigned long long pend = events[i - 1].to;
-
 		const unsigned long long beg = events[i].from;
 
 		if (pbeg <= beg && pend >= beg) {
@@ -451,9 +464,7 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 {
 	struct blkio_event *buf = calloc(size, sizeof(*events));
 	struct blkio_run *runs;
-	unsigned long total_seq, max_seq;
-	size_t total;
-	size_t i, j, k;
+	size_t i, j, k, count, total;
 
 	if (!buf) {
 		ERR("Cannot allocate buffer for queue events\n");
@@ -470,30 +481,12 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 	for (i = 0, j = 0; i != size; ++i) {
 		const struct blkio_event *e = events + i;
 
-		if (!IS_QUEUE(e->type))
-			continue;
-		memcpy(buf + j++, e, sizeof(*buf));
-	}
-
-	total = fill_runs(buf, j, runs);
-	total_seq = max_seq = 0;
-	for (i = 0; i != total; ++i) {
-		const unsigned long seq = (runs[i].last - runs[i].first) + 1;
-
-		total_seq += seq;
-		max_seq = MAX(max_seq, seq);
-	}
-	stats->avg_seq = total_seq / total;
-	stats->max_seq = max_seq;
-	stats->inversions = __ci_merge_sort(runs, total, runs + total);
-
-	for (i = 0, j = 0; i != size; ++i) {
-		const struct blkio_event *e = events + i;
-
 		if (!IS_QUEUE(e->type) || !IS_WRITE(e->type))
 			continue;
 		memcpy(buf + j++, e, sizeof(*buf));
 	}
+	total = count = fill_runs(buf, j, runs);
+	stats->writes_layout.seq = count;
 	blkio_events_sort_by_offset(buf, j);
 	__account_disk_layout(&stats->writes_layout, buf, j);
 
@@ -504,11 +497,17 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 			continue;
 		memcpy(buf + k++, e, sizeof(*buf));
 	}
+	total += (count = fill_runs(buf + j, k, runs + total));
+	stats->reads_layout.seq = count;
 	blkio_events_sort_by_offset(buf + j, k - j);
 	__account_disk_layout(&stats->reads_layout, buf + j, k - j);
 
+	blkio_runs_sort_by_time(runs, total);
+	stats->inversions = __ci_merge_sort(runs, count, runs + total);
+
 	free(runs);
 	free(buf);
+
 	return 0;
 }
 

@@ -14,6 +14,7 @@ struct blkio_disk_layout {
 	__u64 first_sector;
 	__u64 last_sector;
 	__u32 sync;
+	__u32 seq;
 	__u32 io_size[IO_SIZE_BITS];
 	__u32 io_offset[IO_OFFSET_BITS];
 };
@@ -26,8 +27,6 @@ struct blkio_stats {
 	__u32 writes;
 	__u32 iodepth;
 	__u32 batch;
-	__u32 avg_seq;
-	__u32 max_seq;
 	__u32 pid;
 	__u32 cpu;
 	struct blkio_disk_layout reads_layout;
