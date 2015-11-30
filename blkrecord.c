@@ -497,7 +497,7 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 			continue;
 		memcpy(buf + k++, e, sizeof(*buf));
 	}
-	total += (count = fill_runs(buf + j, k, runs + total));
+	total += (count = fill_runs(buf + j, k - j, runs + total));
 	stats->reads_layout.seq = count;
 	blkio_events_sort_by_offset(buf + j, k - j);
 	__account_disk_layout(&stats->reads_layout, buf + j, k - j);

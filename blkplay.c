@@ -428,7 +428,11 @@ static unsigned long __fill_runs(struct usio_io **ios, size_t size,
 
 static unsigned long fill_runs(struct usio_io **ios, size_t size,
 			struct iocb_ctree *nodes, unsigned long seq)
-{ return __fill_runs(ios, size, nodes, (size + seq - 1) / seq); }
+{
+	if (!seq)
+		return 0;
+	return __fill_runs(ios, size, nodes, (size + seq - 1) / seq);
+}
 
 static unsigned long long max_invs(unsigned long long items)
 { return items * (items - 1) / 2; }
