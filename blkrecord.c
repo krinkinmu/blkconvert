@@ -435,14 +435,17 @@ static void __account_disk_layout(struct blkio_disk_layout *layout,
 }
 
 static size_t fill_runs(const struct blkio_event *events, size_t size,
-			struct blkio_run *runs)
+			struct blkio_run *runs,
+			struct blkio_disk_layout *layout)
 {
+	unsigned long len, max_len;
 	size_t count = 1, i;
 
 	if (!size)
 		return 0;
 
 	runs[0].first = runs[0].last = events;
+	max_len = len = 1;
 	for (i = 1; i != size; ++i) {
 		const unsigned long long pbeg = events[i - 1].from;
 		const unsigned long long pend = events[i - 1].to;
@@ -450,12 +453,17 @@ static size_t fill_runs(const struct blkio_event *events, size_t size,
 
 		if (pbeg <= beg && pend >= beg) {
 			runs[count - 1].last = events + i;
+			++len;
+			max_len = MAX(max_len, len);
 		} else {
 			runs[count].first = runs[count].last = events + i;
 			++count;
+			len = 1;
 		}
 	}
 
+	layout->seq = count;
+	layout->max_len = max_len;
 	return count;
 }
 
@@ -485,8 +493,7 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 			continue;
 		memcpy(buf + j++, e, sizeof(*buf));
 	}
-	total = count = fill_runs(buf, j, runs);
-	stats->writes_layout.seq = count;
+	total = count = fill_runs(buf, j, runs, &stats->writes_layout);
 	blkio_events_sort_by_offset(buf, j);
 	__account_disk_layout(&stats->writes_layout, buf, j);
 
@@ -497,8 +504,8 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 			continue;
 		memcpy(buf + k++, e, sizeof(*buf));
 	}
-	total += (count = fill_runs(buf + j, k - j, runs + total));
-	stats->reads_layout.seq = count;
+	total += (count = fill_runs(buf + j, k - j, runs + total,
+		&stats->reads_layout));
 	blkio_events_sort_by_offset(buf + j, k - j);
 	__account_disk_layout(&stats->reads_layout, buf + j, k - j);
 

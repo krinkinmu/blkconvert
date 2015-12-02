@@ -15,6 +15,7 @@ struct blkio_disk_layout {
 	__u64 last_sector;
 	__u32 sync;
 	__u32 seq;
+	__u32 max_len;
 	__u32 io_size[IO_SIZE_BITS];
 	__u32 io_offset[IO_OFFSET_BITS];
 };

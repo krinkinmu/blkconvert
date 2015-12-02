@@ -427,11 +427,28 @@ static unsigned long __fill_runs(struct usio_io **ios, size_t size,
 }
 
 static unsigned long fill_runs(struct usio_io **ios, size_t size,
-			struct iocb_ctree *nodes, unsigned long seq)
+			struct iocb_ctree *nodes,
+			const struct blkio_disk_layout *layout)
 {
+	const unsigned long seq = layout->seq;
+	const unsigned long max_len = layout->max_len;
+
+	unsigned long l, r;
+
 	if (!seq)
 		return 0;
-	return __fill_runs(ios, size, nodes, (size + seq - 1) / seq);
+
+	l = (size + seq - 1) / seq;
+	r = max_len;
+
+	while (l < r) {
+		const unsigned long m = l + (r - l) / 2;
+		const unsigned long count = __fill_runs(ios, size, nodes, m);
+
+		if (count < seq) l = m + 1;
+		else r = m;
+	}
+	return __fill_runs(ios, size, nodes, l);
 }
 
 static unsigned long long max_invs(unsigned long long items)
@@ -567,10 +584,10 @@ static int iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
 		return 1;
 	}
 
-	count = fill_runs(copy, reads, nodes, stat->reads_layout.seq);
+	count = fill_runs(copy, reads, nodes, &stat->reads_layout);
 	total += count;
 	count = fill_runs(copy + reads, writes, nodes + count,
-				stat->writes_layout.seq);
+				&stat->writes_layout);
 	total += count;
 
 	iocb_ctrees_sort_by_offset(nodes, total);
