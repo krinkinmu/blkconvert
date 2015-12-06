@@ -203,6 +203,11 @@ static int blk_io_trace_sync_event(const struct blk_io_trace *trace)
 	return (trace->action & BLK_TC_ACT(BLK_TC_SYNC)) != 0;
 }
 
+static int blk_io_trace_fua_event(const struct blk_io_trace *trace)
+{
+	return (trace->action & BLK_TC_ACT(BLK_TC_FUA)) != 0;
+}
+
 static int blk_io_trace_accept_event(const struct blk_io_trace *trace)
 {
 	if (!trace->bytes)
@@ -222,6 +227,8 @@ static unsigned char blk_io_trace_type(const struct blk_io_trace *trace)
 		type |= WRITE_MASK;
 	if (blk_io_trace_sync_event(trace))
 		type |= SYNC_MASK;
+	if (blk_io_trace_fua_event(trace))
+		type |= FUA_MASK;
 	return type;
 }
 
@@ -311,9 +318,9 @@ struct blkio_run {
 static int blkio_run_offset_compare(const struct blkio_run *l,
 			const struct blkio_run *r)
 {
-	if (l->last->from < r->first->from)
+	if (l->first->from < r->first->from)
 		return -1;
-	if (l->first->from > r->last->from)
+	if (l->first->from > r->first->from)
 		return 1;
 	return 0;
 }
@@ -321,9 +328,9 @@ static int blkio_run_offset_compare(const struct blkio_run *l,
 static int blkio_run_time_compare(const struct blkio_run *l,
 			const struct blkio_run *r)
 {
-	if (l->last->time < r->first->time)
+	if (l->first->time < r->first->time)
 		return -1;
-	if (l->first->time > r->last->time)
+	if (l->first->time > r->first->time)
 		return 1;
 	return 0;
 }
@@ -427,6 +434,8 @@ static void __account_disk_layout(struct blkio_disk_layout *layout,
 
 		if (IS_SYNC(events[i].type))
 			++layout->sync;
+		if (IS_FUA(events[i].type))
+			++layout->fua;
 
 		++ss[MIN(ilog2(len), IO_SIZE_BITS - 1)];
 		end = MAX(end, off + len);
@@ -438,6 +447,8 @@ static size_t fill_runs(const struct blkio_event *events, size_t size,
 			struct blkio_run *runs,
 			struct blkio_disk_layout *layout)
 {
+	const unsigned long long split_delay = 10000ull;
+
 	unsigned long len, max_len;
 	size_t count = 1, i;
 
@@ -447,11 +458,12 @@ static size_t fill_runs(const struct blkio_event *events, size_t size,
 	runs[0].first = runs[0].last = events;
 	max_len = len = 1;
 	for (i = 1; i != size; ++i) {
-		const unsigned long long pbeg = events[i - 1].from;
 		const unsigned long long pend = events[i - 1].to;
 		const unsigned long long beg = events[i].from;
+		const unsigned long long delay =
+			events[i].time - events[i - 1].time;
 
-		if (pbeg <= beg && pend >= beg) {
+		if (pend == beg && delay < split_delay) {
 			runs[count - 1].last = events + i;
 			++len;
 			max_len = MAX(max_len, len);

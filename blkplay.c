@@ -347,12 +347,6 @@ static int iocb_offset_compare(struct usio_io **l, struct usio_io **r)
 }
 
 /**
- * iocbs_sort - sorts iocbs pointers by offset in ascending order
- */
-static void iocbs_sort_by_offset(struct usio_io **iocbs, size_t size)
-{ sort(iocbs, size, &iocb_offset_compare); }
-
-/**
  * We use implicit cartesian tree instead mere array, because we need
  * effectively remove items from middle.
  */
@@ -415,7 +409,7 @@ static unsigned long __fill_runs(struct usio_io **ios, size_t size,
 		const unsigned long long plen = ios[i - 1]->bytes;
 		const unsigned long long off = ios[i]->offset;
 
-		if (poff <= off && poff + plen >= off && len < max_len) {
+		if (poff + plen == off && len < max_len) {
 			nodes[count - 1].last = ios + i;
 			++len;
 		} else {
@@ -438,16 +432,17 @@ static unsigned long fill_runs(struct usio_io **ios, size_t size,
 	if (!seq)
 		return 0;
 
-	l = (size + seq - 1) / seq;
+	l = 1;
 	r = max_len;
 
 	while (l < r) {
 		const unsigned long m = l + (r - l) / 2;
 		const unsigned long count = __fill_runs(ios, size, nodes, m);
 
-		if (count < seq) l = m + 1;
+		if (count > seq) l = m + 1;
 		else r = m;
 	}
+
 	return __fill_runs(ios, size, nodes, l);
 }
 
@@ -511,6 +506,8 @@ static int __iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
 		io_flags[i] = (wr ? 1ul : 0ul);
 	for (i = 0; i != dl->sync; ++i)
 		io_flags[i] |= (1ul << 4) | (1ul << 10);
+	for (i = 0; i != dl->fua; ++i)
+		io_flags[i] |= (1ul << 12);
 	RANDOM_SHUFFLE(io_flags, ios, unsigned long);
 
 	off = first;
@@ -535,7 +532,6 @@ static int __iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
 	}
 	free(io_flags);
 	free(io_offset);
-	iocbs_sort_by_offset(iocbs, ios);
 	return 0;
 }
 
