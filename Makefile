@@ -1,5 +1,5 @@
 CC      ?= gcc
-CFLAGS  ?= -O3 -Wall -Wextra -Werror -D_GNU_SOURCE
+CFLAGS  ?= -std=c99 -O3 -Wall -Wextra -Werror -D_GNU_SOURCE
 LDFLAGS ?= 
 
 BLKPLAY_LDFLAGS   := $(LDFLAGS) -laio -lz
@@ -13,7 +13,7 @@ BLKRECORD_SRC := blkrecord.c blkqueue.c
 BLKRECORD_DEP := $(BLKRECORD_SRC:.c=.d)
 BLKRECORD_OBJ := $(BLKRECORD_SRC:.c=.o)
 
-BLKPLAY_SRC := blkplay.c
+BLKPLAY_SRC := blkplay.c io_engine.c usio_engine.c generator.c
 BLKPLAY_DEP := $(BLKPLAY_SRC:.c=.d)
 BLKPLAY_OBJ := $(BLKPLAY_SRC:.c=.o)
 
