@@ -53,6 +53,7 @@ static struct usio_io *usio_io_create(struct usio_ctx *ctx,
 	io->bytes = bio->bytes;
 	io->offset = bio->offset;
 	io->flags = bio->flags;
+	io->fd = ctx->bfd;
 
 	return io;
 }
@@ -129,6 +130,7 @@ static void usio_close(struct io_context *ctx)
 
 	close(usio->ufd);
 	close(usio->bfd);
+	object_cache_destroy(usio->cache);
 	free(usio->event);
 	free(usio);
 	ctx->private = 0;
