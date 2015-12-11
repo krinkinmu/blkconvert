@@ -189,13 +189,23 @@ static int blk_io_trace_queue_event(const struct blk_io_trace *trace)
 
 static int blk_io_trace_complete_event(const struct blk_io_trace *trace)
 {
-	return ((trace->action & 0xFFFFu) == __BLK_TA_ISSUE) &&
-		(trace->action & BLK_TC_ACT(BLK_TC_ISSUE));
+	return ((trace->action & 0xFFFFu) == __BLK_TA_COMPLETE) &&
+		(trace->action & BLK_TC_ACT(BLK_TC_COMPLETE));
 }
 
 static int blk_io_trace_write_event(const struct blk_io_trace *trace)
 {
 	return (trace->action & BLK_TC_ACT(BLK_TC_WRITE)) != 0;
+}
+
+static int blk_io_trace_sync_event(const struct blk_io_trace *trace)
+{
+	return (trace->action & BLK_TC_ACT(BLK_TC_SYNC)) != 0;
+}
+
+static int blk_io_trace_fua_event(const struct blk_io_trace *trace)
+{
+	return (trace->action & BLK_TC_ACT(BLK_TC_FUA)) != 0;
 }
 
 static int blk_io_trace_accept_event(const struct blk_io_trace *trace)
@@ -215,6 +225,10 @@ static unsigned char blk_io_trace_type(const struct blk_io_trace *trace)
 		type |= QUEUE_MASK;
 	if (blk_io_trace_write_event(trace))
 		type |= WRITE_MASK;
+	if (blk_io_trace_sync_event(trace))
+		type |= SYNC_MASK;
+	if (blk_io_trace_fua_event(trace))
+		type |= FUA_MASK;
 	return type;
 }
 
@@ -296,6 +310,34 @@ static int blkio_stats_dump(struct blkio_record_context *ctx,
 	return mywrite(ctx->ofd, buffer, strlen(buffer));
 }
 
+struct blkio_run {
+	const struct blkio_event *first;
+	const struct blkio_event *last;
+};
+
+static int blkio_run_offset_compare(const struct blkio_run *l,
+			const struct blkio_run *r)
+{
+	if (l->first->from < r->first->from)
+		return -1;
+	if (l->first->from > r->first->from)
+		return 1;
+	return 0;
+}
+
+static int blkio_run_time_compare(const struct blkio_run *l,
+			const struct blkio_run *r)
+{
+	if (l->first->time < r->first->time)
+		return -1;
+	if (l->first->time > r->first->time)
+		return 1;
+	return 0;
+}
+
+static void blkio_runs_sort_by_time(struct blkio_run *events, size_t size)
+{ sort(events, size, &blkio_run_time_compare); }
+
 /**
  * __ci_merge - merges two sorted arrays and count number of
  *              inversions. Place result in buf array, so it
@@ -355,6 +397,7 @@ static unsigned long long __ci_merge_sort(struct blkio_event *events,
 static unsigned ilog2(unsigned long long x)
 {
 	unsigned power = 0;
+
 	while (x >>= 1)
 		++power;
 	return power;
@@ -388,17 +431,60 @@ static void __account_disk_layout(struct blkio_disk_layout *layout,
 			++so[MIN(1 + ilog2(off - end), IO_OFFSET_BITS - 1)];
 		else
 			++so[0];
+
+		if (IS_SYNC(events[i].type))
+			++layout->sync;
+		if (IS_FUA(events[i].type))
+			++layout->fua;
+
 		++ss[MIN(ilog2(len), IO_SIZE_BITS - 1)];
 		end = MAX(end, off + len);
 	}
 	layout->last_sector = end;
 }
 
+static size_t fill_runs(const struct blkio_event *events, size_t size,
+			struct blkio_run *runs,
+			struct blkio_disk_layout *layout)
+{
+	const unsigned long long split_delay = 10000ull;
+
+	unsigned long len, max_len;
+	size_t count = 1, i;
+
+	if (!size)
+		return 0;
+
+	runs[0].first = runs[0].last = events;
+	max_len = len = 1;
+	for (i = 1; i != size; ++i) {
+		const unsigned long long pend = events[i - 1].to;
+		const unsigned long long beg = events[i].from;
+		const unsigned long long delay =
+			events[i].time - events[i - 1].time;
+
+		if (pend == beg && delay < split_delay) {
+			runs[count - 1].last = events + i;
+			++len;
+			max_len = MAX(max_len, len);
+		} else {
+			runs[count].first = runs[count].last = events + i;
+			++count;
+			len = 1;
+		}
+	}
+
+	layout->seq = count;
+	layout->max_len = max_len;
+	return count;
+}
+
 static int account_disk_layout_stats(struct blkio_stats *stats,
 			const struct blkio_event *events, size_t size)
 {
-	struct blkio_event *buf = calloc(2 * size, sizeof(*events));
-	size_t i, j;
+	struct blkio_event *buf = calloc(size, sizeof(*events));
+	struct blkio_run *runs;
+	size_t i, j, k, count, total;
 
 	if (!buf) {
 		ERR("Cannot allocate buffer for queue events\n");
@@ -408,19 +494,11 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 	for (i = 0, j = 0; i != size; ++i) {
 		const struct blkio_event *e = events + i;
 
-		if (!IS_QUEUE(e->type))
-			continue;
-		memcpy(buf + j++, e, sizeof(*buf));
-	}
-	stats->inversions = __ci_merge_sort(buf, j, buf + j);
-
-	for (i = 0, j = 0; i != size; ++i) {
-		const struct blkio_event *e = events + i;
-
 		if (!IS_QUEUE(e->type) || !IS_WRITE(e->type))
 			continue;
 		memcpy(buf + j++, e, sizeof(*buf));
 	}
+	total = count = fill_runs(buf, j, runs, &stats->writes_layout);
 	blkio_events_sort_by_offset(buf, j);
 	__account_disk_layout(&stats->writes_layout, buf, j);
 
@@ -431,19 +509,28 @@ static int account_disk_layout_stats(struct blkio_stats *stats,
 			continue;
 		memcpy(buf + j++, e, sizeof(*buf));
 	}
-	blkio_events_sort_by_offset(buf, j);
-	__account_disk_layout(&stats->reads_layout, buf, j);
+	total += (count = fill_runs(buf + j, k - j, runs + total,
+		&stats->reads_layout));
+	blkio_events_sort_by_offset(buf + j, k - j);
+	__account_disk_layout(&stats->reads_layout, buf + j, k - j);
 
+	blkio_runs_sort_by_time(runs, total);
+	stats->inversions = __ci_merge_sort(runs, count, runs + total);
+
+	free(runs);
 	free(buf);
+
 	return 0;
 }
 
 static int account_general_stats(struct blkio_stats *stats,
 			const struct blkio_event *events, size_t size)
 {
-	unsigned long total_iodepth = 0, iodepth = 0;
 	unsigned long long begin = ~0ull, end = 0;
-	unsigned long reads = 0, writes = 0, rw_bursts = 0;
+	unsigned long long total_iodepth = 0;
+	unsigned long reads = 0, writes = 0, queues;
+	unsigned long iodepth = 0;
+	unsigned long bursts = 0;
 	size_t i;
 
 	for (i = 0; i != size; ++i) {
@@ -452,29 +539,34 @@ static int account_general_stats(struct blkio_stats *stats,
 				++writes;
 			else
 				++reads;
+
 			++iodepth;
+
 			begin = MIN(begin, events[i].time);
 			end = MAX(end, events[i].time);
 		} else {
 			if (i && IS_QUEUE(events[i - 1].type)) {
 				total_iodepth += iodepth;
-				++rw_bursts;
+				++bursts;
 			}
+
 			if (iodepth)
 				--iodepth;
 		}
 	}
 
-	if (reads + writes == 0)
+	queues = reads + writes;
+	if (!queues)
 		return 0;
 
-	if (IS_QUEUE(events[i - 1].type)) {
+	if (iodepth) {
 		total_iodepth += iodepth;
-		++rw_bursts;
+		++bursts;
 	}
 
-	stats->batch = (reads + writes + rw_bursts - 1) / rw_bursts;
-	stats->iodepth = MAX(1, (total_iodepth + rw_bursts - 1) / rw_bursts);
+	stats->batch = (queues + bursts - 1) / bursts;
+	stats->iodepth = (total_iodepth + bursts - 1) / bursts;
+
 	stats->begin_time = begin;
 	stats->end_time = end;
 	stats->reads = reads;
@@ -684,8 +776,7 @@ static void blkio_event_handle_complete(struct blkio_record_context *ctx,
 		for (; pos != head; pos = pos->next) {
 			struct process_info *pi = PROCESS_INFO(pos);
 
-			if (pi->pid == event->pid && pi->cpu == event->cpu &&
-			    pi->events->time <= event->time) {
+			if (pi->pid == queue->pid && pi->cpu == queue->cpu) {
 				process_info_append(pi, event);
 				break;
 			}
@@ -705,7 +796,7 @@ static void blkio_event_handle(struct blkio_record_context *ctx,
 
 static void blkrecord(struct blkio_record_context *ctx)
 {
-	unsigned long events_total = 0;
+	unsigned long events_total = 0, queues = 0;
 	struct blk_io_trace trace;
 
 	while (!done && !blk_io_trace_read(ctx, &trace)) {
@@ -721,11 +812,17 @@ static void blkrecord(struct blkio_record_context *ctx)
 		event.cpu = per_cpu ? trace.cpu : 0;
 		event.type = blk_io_trace_type(&trace);
 
+
+		if (IS_QUEUE(event.type))
+			++queues;
+
 		blkio_event_handle(ctx, &event);
 		++events_total;
 	}
 	blkio_record_context_dump(ctx, ~0ull);
 	ERR("total events processed: %lu\n", events_total);
+	ERR("queues: %lu\n", queues);
+	ERR("completes: %lu\n", events_total - queues);
 }
 
 static void handle_signal(int sig)
