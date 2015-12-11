@@ -13,7 +13,7 @@ BLKRECORD_SRC := blkrecord.c blkqueue.c
 BLKRECORD_DEP := $(BLKRECORD_SRC:.c=.d)
 BLKRECORD_OBJ := $(BLKRECORD_SRC:.c=.o)
 
-BLKPLAY_SRC := blkplay.c io_engine.c usio_engine.c generator.c
+BLKPLAY_SRC := blkplay.c io_engine.c usio_engine.c aio_engine.c generator.c
 BLKPLAY_DEP := $(BLKPLAY_SRC:.c=.d)
 BLKPLAY_OBJ := $(BLKPLAY_SRC:.c=.o)
 

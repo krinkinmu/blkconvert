@@ -22,6 +22,7 @@
 #include "io_engine.h"
 #include "generator.h"
 #include "usio_engine.h"
+#include "aio_engine.h"
 #include "file_io.h"
 #include "common.h"
 #include "debug.h"
@@ -30,7 +31,8 @@ static const unsigned long long NS = 1000000000ull;
 
 static const char *input_file_name;
 static const char *block_device_name;
-static const char *io_engine = "usio";
+static const char *io_engine_name = "usio";
+static const struct io_engine *io_engine;
 static int number_of_events = 512;
 static int time_accurate;
 static int keep_io_delay;
@@ -61,6 +63,17 @@ static void show_usage(const char *name)
 		"\t-t Time accurate playing.\n";
 
 	ERR("Usage: %s %s", name, usage);
+}
+
+static const struct io_engine *io_engine_find(const char *name)
+{
+	const char *names[] = { "usio", "aio" };
+	const const struct io_engine *engines[] = { usio_engine, aio_engine };
+
+	for (int i = 0; i != sizeof(names)/sizeof(names[0]); ++i)
+		if (!strcmp(names[i], name))
+			return engines[i];
+	return 0;
 }
 
 static int pid_compare(unsigned long lpid, unsigned long rpid)
@@ -162,7 +175,7 @@ static int parse_args(int argc, char **argv)
 				pids_to_play[pids_to_play_size++] = i;
 			break;
 		case 'g':
-			io_engine = optarg;
+			io_engine_name = optarg;
 			break;
 		case 'i':
 			keep_io_delay = 1;
@@ -188,8 +201,9 @@ static int parse_args(int argc, char **argv)
 		return 1;
 	}
 
-	if (strcmp(io_engine, "usio")) {
-		ERR("Unsupported io engine %s\n", io_engine);
+	io_engine = io_engine_find(io_engine_name);
+	if (!io_engine) {
+		ERR("Unsupported io engine %s\n", io_engine_name);
 		return 1;
 	}
 
@@ -333,7 +347,7 @@ static void play(int fd)
 	struct blkio_stats stats;
 	struct io_context ctx;
 
-	int rc = io_engine_setup(&ctx, usio_engine, block_device_name,
+	int rc = io_engine_setup(&ctx, io_engine, block_device_name,
 				number_of_events);
 	if (rc) {
 		ERR("Cannot create io context\n");
