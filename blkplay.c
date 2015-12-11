@@ -17,34 +17,30 @@
 
 #include <zlib.h>
 
-#include "usio.h"
-
-#include "object_cache.h"
 #include "algorithm.h"
 #include "blkrecord.h"
+#include "io_engine.h"
+#include "generator.h"
+#include "usio_engine.h"
 #include "file_io.h"
 #include "common.h"
-#include "ctree.h"
 #include "debug.h"
 
 static const unsigned long long NS = 1000000000ull;
-static const unsigned sector_size = 512u;
 
 static const char *input_file_name;
-static const char *device_file_name;
-static unsigned number_of_events = 512u;
-static unsigned page_size = 4096u;
-static int use_direct_io = 1;
-static int time_accurate = 0;
-static int keep_io_delay = 0;
+static const char *block_device_name;
+static const char *io_engine = "usio";
+static int number_of_events = 512;
+static int time_accurate;
+static int keep_io_delay;
 
-#define BYTES(sectors)      ((sectors) * sector_size)
-#define SECTORS(bytes)      (((bytes) + sector_size - 1)/sector_size)
 #define MAX_PIDS_SIZE       1024
 #define MAX_PLAY_PROCESSES  256
 
 static unsigned long pids_to_play[MAX_PIDS_SIZE];
 static unsigned pids_to_play_size;
+
 
 static void show_usage(const char *name)
 {
@@ -52,19 +48,17 @@ static void show_usage(const char *name)
 		" -d <device>           | --device=<device>\n" \
 		" -f <input file>       | --file=<input file>\n" \
 		"[-e <number of events> | --events=<number of events>]\n" \
-		"[-s <sector size>      | --sector=<sector size>]\n" \
 		"[-p <pid>              | --pid=<pid>]\n" \
+		"[-g <io engine>        | --engine=<io engine>]\n"
 		"[-i                    | --keep_io_delay]\n" \
 		"[-t                    | --time]\n" \
-		"[-b                    | --buffered]\n" \
 		"\t-d Block device file. Must be specified.\n" \
 		"\t-f Use specified blkrecord file. Default: stdin\n" \
 		"\t-e Max number of concurrently processing events. Default: 512\n" \
-		"\t-s Block device sector size. Default: 512\n" \
 		"\t-p Process PID to play.\n" \
+		"\t-g IO engine to play. Default: usio.\n" \
 		"\t-i Keep time interval between IO.\n" \
-		"\t-t Time accurate playing.\n" \
-		"\t-b Use buffered IO (do not use direct IO)\n";
+		"\t-t Time accurate playing.\n";
 
 	ERR("Usage: %s %s", name, usage);
 }
@@ -82,16 +76,22 @@ static int parse_args(int argc, char **argv)
 {
 	static struct option long_opts[] = {
 		{
+			.name = "file",
+			.has_arg = required_argument,
+			.flag = NULL,
+			.val = 'f'
+		},
+		{
 			.name = "device",
 			.has_arg = required_argument,
 			.flag = NULL,
 			.val = 'd'
 		},
 		{
-			.name = "file",
+			.name = "pid",
 			.has_arg = required_argument,
 			.flag = NULL,
-			.val = 'f'
+			.val = 'p'
 		},
 		{
 			.name = "events",
@@ -100,10 +100,10 @@ static int parse_args(int argc, char **argv)
 			.val = 'e'
 		},
 		{
-			.name = "pid",
+			.name = "engine",
 			.has_arg = required_argument,
 			.flag = NULL,
-			.val = 'p'
+			.val = 'g'
 		},
 		{
 			.name = "keep_io_delay",
@@ -118,16 +118,10 @@ static int parse_args(int argc, char **argv)
 			.val = 't'
 		},
 		{
-			.name = "buffered",
-			.has_arg = no_argument,
-			.flag = NULL,
-			.val = 'b'
-		},
-		{
 			.name = NULL
 		}
 	};
-	static const char *opts = "d:f:e:p:itb";
+	static const char *opts = "d:e:f:p:g:it";
 
 	unsigned j;
 	long i;
@@ -136,18 +130,19 @@ static int parse_args(int argc, char **argv)
 	while ((c = getopt_long(argc, argv, opts, long_opts, NULL)) >= 0) {
 		switch (c) {
 		case 'd':
-			device_file_name = optarg;
+			block_device_name = optarg;
 			break;
 		case 'f':
 			input_file_name = optarg;
 			break;
 		case 'e':
 			i = atol(optarg);
-			if (i <= 0) {
+			if (i < 0) {
 				ERR("Number of events must be positive\n");
 				return 1;
 			}
-			number_of_events = (unsigned)i;
+
+			number_of_events = i;
 			break;
 		case 'p':
 			i = atol(optarg);
@@ -166,14 +161,14 @@ static int parse_args(int argc, char **argv)
 			if (!found)
 				pids_to_play[pids_to_play_size++] = i;
 			break;
+		case 'g':
+			io_engine = optarg;
+			break;
 		case 'i':
 			keep_io_delay = 1;
 			break;
 		case 't':
 			time_accurate = 1;
-			break;
-		case 'b':
-			use_direct_io = 0;
 			break;
 		default:
 			show_usage(argv[0]);
@@ -182,14 +177,19 @@ static int parse_args(int argc, char **argv)
 	}
 
 	if (!input_file_name) {
-		ERR("Spcify input file name\n");
+		ERR("You must specify input file name\n");
 		show_usage(argv[0]);
 		return 1;
 	}
 
-	if (!device_file_name) {
-		ERR("Spcify device file name\n");
+	if (!block_device_name) {
+		ERR("You must specify block device name\n");
 		show_usage(argv[0]);
+		return 1;
+	}
+
+	if (strcmp(io_engine, "usio")) {
+		ERR("Unsupported io engine %s\n", io_engine);
 		return 1;
 	}
 
@@ -244,19 +244,6 @@ static int blkio_zstats_read(gzFile zfd, struct blkio_stats *stats)
 	return 0;
 }
 
-static unsigned long myrandom(unsigned long from, unsigned long to)
-{
-	const unsigned long bits = 15;
-	const unsigned long mask = (1ul << bits) - 1;
-
-	unsigned long value = 0;
-	unsigned gen;
-
-	for (gen = 0; gen < sizeof(value) * 8; gen += bits)
-		value |= ((unsigned long)rand() & mask) << gen;
-	return value % (to - from) + from;
-}
-
 static void delay(unsigned long long ns)
 {
 	struct timespec wait;
@@ -271,492 +258,6 @@ static void delay(unsigned long long ns)
 	nanosleep(&wait, 0);
 }
 
-struct process_context {
-	int io_ctx;
-	struct usio_event *events;
-	long size, running;
-	int fd;
-	struct object_cache *cache;
-};
-
-/**
- * struct iocb management routines (cached allocation and release mostly).
- */
-static struct usio_io *iocb_alloc(struct object_cache *cache)
-{
-	return object_cache_alloc(cache);
-}
-
-static void iocb_free(struct object_cache *cache, struct usio_io *iocb)
-{
-	object_cache_free(cache, iocb);
-}
-
-static struct usio_io *iocb_get(struct process_context *ctx,
-			unsigned long long off, unsigned long len,
-			unsigned long flags)
-{
-	struct usio_io *iocb;
-	void *buf;
-
-	if (!(iocb = iocb_alloc(ctx->cache))) {
-		ERR("Cannot allocate iocb\n");
-		return 0;
-	}
-
-	if (posix_memalign(&buf, page_size, len)) {
-		ERR("Cannot allocate buffer for an IO operation\n");
-		iocb_free(ctx->cache, iocb);
-		return 0;
-	}
-
-	if (flags & 1)
-		memset(buf, 0x13, len);
-
-	iocb->data = (unsigned long)buf;
-	iocb->bytes = len;
-	iocb->offset = off;
-	iocb->flags = flags;
-	iocb->fd = ctx->fd;
-
-	return iocb;
-}
-
-static void iocb_release(struct process_context *ctx, struct usio_io *iocb)
-{
-	free((void *)iocb->data);
-	iocb_free(ctx->cache, iocb);
-}
-
-static void iocbs_release(struct process_context *ctx, struct usio_io **iocbs,
-			size_t count)
-{
-	size_t i;
-	for (i = 0; i != count; ++i)
-		iocb_release(ctx, iocbs[i]);
-}
-
-
-static int iocb_offset_compare(struct usio_io **l, struct usio_io **r)
-{
-	if ((*l)->offset < (*r)->offset)
-		return -1;
-	if ((*l)->offset > (*r)->offset)
-		return 1;
-	return 0;
-}
-
-/**
- * We use implicit cartesian tree instead mere array, because we need
- * effectively remove items from middle.
- */
-struct iocb_ctree {
-	struct ctree link;
-	struct usio_io **first;
-	struct usio_io **last;
-};
-
-static int iocb_ctree_offset_compare(struct iocb_ctree *l, struct iocb_ctree *r)
-{ return iocb_offset_compare(l->first, r->first); }
-
-static void iocb_ctrees_sort_by_offset(struct iocb_ctree *runs, size_t size)
-{ sort(runs, size, &iocb_ctree_offset_compare); }
-
-static void iocb_ctree_node_init(struct iocb_ctree *tree, struct usio_io **io)
-{
-	cinit(&tree->link);
-	tree->first = tree->last = io;
-}
-
-/**
- * iocb_ctree_append - append node to the end of tree.
- *
- * tree - pointer to pointer to tree to append to :)
- * node - new node to insert.
- */
-static void iocb_ctree_append(struct ctree **tree, struct iocb_ctree *node)
-{ *tree = cappend(*tree, &node->link); }
-
-/**
- * iocb_ctree_extract - removes idx node from the tree, and returns pointer.
- *
- * tree - tree to remove item from
- * idx - item index (starting from 0)
- *
- * NODE: tree MUST contain at least idx items.
- */
-static struct iocb_ctree *iocb_ctree_extract(struct ctree **tree,
-			size_t idx)
-{
-	struct ctree *node;
-
-	assert(idx < csize(*tree) && "Tree is too small");
-	*tree = cextract(*tree, idx, &node);
-	assert(node && "Node must not be NULL");
-	return centry(node, struct iocb_ctree, link);
-}
-
-static unsigned long __fill_runs(struct usio_io **ios, size_t size,
-			struct iocb_ctree *nodes, unsigned long max_len)
-{
-	unsigned long count;
-	size_t i, len;
-
-	iocb_ctree_node_init(nodes, ios);
-	len = 1;
-	for (i = 1, count = 1; i != size; ++i) {
-		const unsigned long long poff = ios[i - 1]->offset;
-		const unsigned long long plen = ios[i - 1]->bytes;
-		const unsigned long long off = ios[i]->offset;
-
-		if (poff + plen == off && len < max_len) {
-			nodes[count - 1].last = ios + i;
-			++len;
-		} else {
-			iocb_ctree_node_init(nodes + count++, ios + i);
-			len = 1;
-		}
-	}
-	return count;
-}
-
-static unsigned long fill_runs(struct usio_io **ios, size_t size,
-			struct iocb_ctree *nodes,
-			const struct blkio_disk_layout *layout)
-{
-	const unsigned long seq = layout->seq;
-	const unsigned long max_len = layout->max_len;
-
-	unsigned long l, r;
-
-	if (!seq)
-		return 0;
-
-	l = 1;
-	r = max_len;
-
-	while (l < r) {
-		const unsigned long m = l + (r - l) / 2;
-		const unsigned long count = __fill_runs(ios, size, nodes, m);
-
-		if (count > seq) l = m + 1;
-		else r = m;
-	}
-
-	return __fill_runs(ios, size, nodes, l);
-}
-
-static unsigned long long max_invs(unsigned long long items)
-{ return items * (items - 1) / 2; }
-
-#define RANDOM_SHUFFLE(array, size, type) \
-	do { \
-		const size_t __size = (size); \
-		type *__array = (array); \
-		size_t __i; \
-		if (__size < 2) \
-			break; \
-		for (__i = 0; __i != __size - 1; ++__i) { \
-			const size_t pos = myrandom(__i, __size); \
-			const type tmp = __array[pos]; \
-			__array[pos] = __array[__i]; \
-			__array[__i] = tmp; \
-		} \
-	} while (0)
-
-static int __iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
-			int wr, const struct blkio_disk_layout *dl)
-{
-	const unsigned long long first = dl->first_sector;
-	const unsigned long long last = dl->last_sector;
-
-	unsigned long long *io_offset;
-	unsigned long long off;
-	unsigned long i, j, ios = 0;
-	unsigned long *io_flags;
-
-	for (i = 0; i != IO_OFFSET_BITS; ++i)
-		ios += dl->io_offset[i];
-
-	if (!ios)
-		return 0;
-
-	io_offset = calloc(ios, sizeof(*io_offset));
-	if (!io_offset) {
-		ERR("Cannot allocate array of IO sizes\n");
-		return 1;
-	}
-
-	io_flags = calloc(ios, sizeof(*io_flags));
-	if (!io_flags) {
-		ERR("Cannot allocate flags array\n");
-		free(io_offset);
-		return 1;
-	}
-
-	for (i = 0, j = 0; i != IO_OFFSET_BITS; ++i) {
-		unsigned long k;
-
-		for (k = 0; k != dl->io_offset[i]; ++k)
-			io_offset[j++] = i ? (1ull << (i - 1)) : 0;
-	}
-	RANDOM_SHUFFLE(io_offset, ios, unsigned long long);
-
-	for (i = 0; i != ios; ++i)
-		io_flags[i] = (wr ? 1ul : 0ul);
-	for (i = 0; i != dl->sync; ++i)
-		io_flags[i] |= (1ul << 4) | (1ul << 10);
-	for (i = 0; i != dl->fua; ++i)
-		io_flags[i] |= (1ul << 12);
-	RANDOM_SHUFFLE(io_flags, ios, unsigned long);
-
-	off = first;
-	for (i = 0, j = 0; i != IO_SIZE_BITS; ++i) {
-		const unsigned long size = 1ul << i;
-		unsigned long k;
-
-		for (k = 0; k != dl->io_size[i]; ++k) {
-			if (off + size > last)
-				off = first;
-
-			iocbs[j] = iocb_get(ctx, BYTES(off), BYTES(size),
-						io_flags[j]);
-			if (!iocbs[j]) {
-				iocbs_release(ctx, iocbs, j);
-				free(io_flags);
-				free(io_offset);
-				return 1;
-			}
-			off += size + io_offset[j++];
-		}
-	}
-	free(io_flags);
-	free(io_offset);
-	return 0;
-}
-
-/**
- * iocbs_fill - genreates iocbs accoriding to stat. Number of
- *              iocbs to generate is stat->reads + stats->writes.
- *
- * iocbs - array large enough to store appropriate number of iocb
- *         pointers
- * fd - file descriptor to work with
- * stat - IO parameters.
- */
-static int iocbs_fill(struct usio_io **iocbs, struct process_context *ctx,
-			const struct blkio_stats *stat)
-{
-	const unsigned long reads = stat->reads;
-	const unsigned long writes = stat->writes;
-	const unsigned long size = reads + writes;
-
-	unsigned long long invs = stat->inversions;
-	unsigned long i, j, count, total = 0;
-	struct usio_io **copy;
-	struct iocb_ctree *nodes;
-	struct ctree *tree = 0;
-
-	copy = calloc(size, sizeof(*copy));
-	if (!copy) {
-		ERR("Cannot allocate array for iocbs copy\n");
-		return 1;
-	}
-
-	if (__iocbs_fill(copy, ctx, 0, &stat->reads_layout)) {
-		free(copy);
-		return 1;
-	}
-
-	if (__iocbs_fill(copy + reads, ctx, 1, &stat->writes_layout)) {
-		free(copy);
-		return 1;
-	}
-
-	nodes = calloc(size, sizeof(*nodes));
-	if (!nodes) {
-		ERR("Cannot allocate cartesian tree nodes\n");
-		free(copy);
-		return 1;
-	}
-
-	count = fill_runs(copy, reads, nodes, &stat->reads_layout);
-	total += count;
-	count = fill_runs(copy + reads, writes, nodes + count,
-				&stat->writes_layout);
-	total += count;
-
-	iocb_ctrees_sort_by_offset(nodes, total);
-	for (i = 0; i != total; ++i)
-		iocb_ctree_append(&tree, nodes + i);
-
-	for (i = 0, j = 0; i != total; ++i) {
-		const unsigned long long max = total - i - 1;
-		const unsigned long min = max_invs(max) < invs
-					? MIN(max, invs - max_invs(max)) : 0;
-		const unsigned long idx = myrandom(min, max + 1);
-
-		struct usio_io **first, **last;
-		struct iocb_ctree *node;
-
-		node = iocb_ctree_extract(&tree, idx);
-		invs -= idx;
-		first = node->first;
-		last = node->last;
-		while (first <= last)
-			iocbs[j++] = *first++;
-	}
-	free(nodes);
-	free(copy);
-
-	return 0;
-}
-
-/**
- * iocbs_submit - submits exactly count IOs from iocbs array.
- *
- * ctx - initialized process_context
- * iocbs - array of at least count iocbs
- * count - number of IOs to submit
- *
- * Returns number of submitted IOs, if returned value less then count,
- * then error occured.
- */
-static size_t iocbs_submit(struct process_context *ctx, struct usio_io **iocbs,
-			size_t count)
-{
-	size_t sb = 0;
-
-	while (sb != count) {
-		struct usio_ios req;
-		int ret;
-
-		req.count = count - sb;
-		req.ios = iocbs + sb;
-
-		ret = ioctl(ctx->io_ctx, USIO_SUBMIT, &req);
-		if (ret < 0) {
-			ERR("Error %d, while submiting IO\n", -ret);
-			ERR("iocb offset %lld, size %lu, ptr %lx\n",
-				iocbs[sb]->offset,
-				(unsigned long)iocbs[sb]->bytes,
-				(unsigned long)iocbs[sb]->data);
-			return sb;
-		}
-		sb += ret;
-	}
-	return sb;
-}
-
-static long iocbs_reclaim(struct process_context *ctx, long count)
-{
-	struct usio_events events;
-
-	events.min_count = MIN(count, ctx->size);
-	events.max_count = ctx->size;
-	events.events = ctx->events;
-
-	return ioctl(ctx->io_ctx, USIO_RECLAIM, &events);
-}
-
-/**
- * io_events_check_and_release - check events array filled with io_getevents.
- *                               If at least one of io_event reports error
- *                               function print detailed info to stderr and
- *                               returns 1. Also releases all iocbs.
- */
-static int io_events_check_and_release(struct process_context *ctx,
-			size_t count)
-{
-	size_t i;
-	int ret = 0;
-
-	for (i = 0; i != count; ++i) {
-		struct usio_event *e = ctx->events + i;
-		struct usio_io *iocb = (struct usio_io *)e->io;
-
-		if (e->res) {
-			const char *op = (iocb->flags & 1) ? "write" : "read";
-			ERR("AIO %s of %ld bytes at %ld failed (%ld)\n",
-						op,
-						(unsigned long)iocb->bytes,
-						(unsigned long)iocb->offset,
-						(unsigned long)e->res);
-			ret = 1;
-		}
-		iocb_release(ctx, iocb);
-	}
-	return ret;
-}
-
-static int open_disk_file(void)
-{	
-	int flags = O_RDWR;
-	int fd;
-
-	if (use_direct_io)
-		flags |= O_DIRECT;
-
-	fd = open(device_file_name, flags);
-	if (fd < 0)
-		perror("Cannot open block device file");
-
-	return fd;
-}
-
-static int process_context_setup(struct process_context *ctx)
-{
-	ctx->size = number_of_events;
-	ctx->running = 0;
-	ctx->fd = open_disk_file();
-
-	if (ctx->fd < 0)
-		return 1;
-
-	ctx->cache = object_cache_create(sizeof(struct usio_io));
-	if (!ctx->cache) {
-		ERR("Cannot create iocb cache\n");
-		close(ctx->fd);
-		return 1;
-	}
-
-	ctx->events = calloc(number_of_events, sizeof(struct usio_event));
-	if (!ctx->events) {
-		ERR("Cannot allocate array of io_event\n");
-		object_cache_destroy(ctx->cache);
-		close(ctx->fd);
-		return 1;
-	}
-
-	ctx->io_ctx = open("/dev/usio", O_RDWR);
-	if (ctx->io_ctx < 0) {
-		ERR("Cannot open /dev/usio (%d)\n", errno);
-		free(ctx->events);
-		object_cache_destroy(ctx->cache);
-		close(ctx->fd);
-		return 1;
-	}
-
-	return 0;
-}
-
-static void process_context_destroy(struct process_context *ctx)
-{
-	if (ctx->running) {
-		const long ret = iocbs_reclaim(ctx, ctx->running);
-
-		if (ret < 0)
-			ERR("Error %d, while reclaiming IO\n", errno);
-		else
-			io_events_check_and_release(ctx, ret);
-	}
-
-	close(ctx->io_ctx);
-	free(ctx->events);
-	object_cache_destroy(ctx->cache);
-	close(ctx->fd);
-}
-
 /**
  * blkio_stats_play - generate, submit and recalim IOs.
  *
@@ -766,81 +267,76 @@ static void process_context_destroy(struct process_context *ctx)
  *
  * Returns 0, if success.
  */
-static int blkio_stats_play(struct process_context *ctx,
+static int blkio_stats_play(struct io_context *ctx,
 			const struct blkio_stats *stat)
 {
-	const long ios = stat->reads + stat->writes;
-	const long iodepth = MIN(stat->iodepth, ctx->size);
-	const long batch = MIN(iodepth, stat->batch);
+	const int ios = stat->reads + stat->writes;
+	const int iodepth = MIN(stat->iodepth, ctx->size);
+	const int batch = MIN(iodepth, stat->batch);
 
 	unsigned long long wait = 0;
-	struct usio_io **iocbs;
-	long submit_i;
-	int rc = 0;
 
 	if (keep_io_delay && ios > 1)
 		wait = (stat->end_time - stat->begin_time) / (ios - 1);
 
-	iocbs = calloc(ios, sizeof(*iocbs));
-	if (!iocbs) {
-		ERR("Cannot allocate array of struct iocb\n");
+	struct bio *bios = calloc(ios, sizeof(*bios));
+
+	if (!bios) {
+		ERR("Cannot allocate array of bio structures\n");
 		return 1;
 	}
 
-	if (iocbs_fill(iocbs, ctx, stat)) {
-		free(iocbs);
+	if (bio_generate(bios, stat)) {
+		free(bios);
 		return 1;
 	}
 
-	submit_i = 0;
-	while (submit_i != ios) {
-		long submit = 0, reclaim = 1;
-		long next, submitted, reclaimed;
+	int ret = 0;
+
+	for (int s = 0; s != ios;) {
+		int todo = 0;
 
 		if (ctx->running < iodepth)
-			submit = MIN(ios - submit_i, iodepth - ctx->running);
+			todo = MIN(ios - s, iodepth - ctx->running);
 
-		submitted = iocbs_submit(ctx, iocbs + submit_i, submit);
-		submit_i += submitted;
-		ctx->running += submitted;
+		int rc = io_engine_submit(ctx, bios + s, todo);
+
+		if (rc < todo) {
+			ret = 1;
+			break;
+		}
 
 		if (keep_io_delay)
-			delay(submitted * wait);
+			delay(rc * wait);
 
-		if (submitted < submit) {
-			rc = 1;
-			break;
-		}
+		s += rc;
 
-		next = MIN(ios - submit_i, batch);
+		int next = MIN(ios - s, batch);
+
+		todo = 1;
 		if (ctx->running > iodepth - next)
-			reclaim = ctx->running - iodepth + next;
-		reclaimed = iocbs_reclaim(ctx, reclaim);
-		if (reclaimed < 0) {
-			ERR("Error %ld, while reclaiming IO\n", -reclaimed);
-			rc = 1;
-			break;
-		}
-		ctx->running -= reclaimed;
+			todo = ctx->running - iodepth + next;
 
-		if (io_events_check_and_release(ctx, reclaimed)) {
-			rc = 1;
+		rc = io_engine_reclaim(ctx, todo, INT_MAX);
+		if (rc < 0) {
+			ret = 1;
 			break;
 		}
 	}
+	free(bios);
 
-	iocbs_release(ctx, iocbs + submit_i, ios - submit_i);
-	free(iocbs);
-	return rc;
+	return ret;
 }
 
 static void play(int fd)
 {
-	struct process_context ctx;
 	struct blkio_stats stats;
+	struct io_context ctx;
 
-	if (process_context_setup(&ctx)) {
-		ERR("Cannot create process context\n");
+	int rc = io_engine_setup(&ctx, usio_engine, block_device_name,
+				number_of_events);
+	if (rc) {
+		ERR("Cannot create io context\n");
 		return;
 	}
 
@@ -848,7 +344,7 @@ static void play(int fd)
 		if (blkio_stats_play(&ctx, &stats))
 			break;
 	}
-	process_context_destroy(&ctx);
+	io_engine_release(&ctx);
 }
 
 static unsigned long long current_time(void)
