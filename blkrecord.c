@@ -25,9 +25,9 @@ static const char *input_file_name;
 static const char *output_file_name;
 static unsigned min_time_interval = 1000u;
 static int binary = 1;
-static int per_process = 0, per_cpu = 0;
+static int per_process, per_cpu;
 
-static volatile sig_atomic_t done = 0;
+static volatile sig_atomic_t done;
 
 static void show_usage(const char *name)
 {
