@@ -6,6 +6,7 @@ static ssize_t syslog_write(void *cookie, const char *buf, size_t size)
 {
 	(void)cookie;
 
+	*((char *)(buf + size - 1)) = 0;
 	syslog(LOG_ERR, "%s", buf);
 	return size;
 }
