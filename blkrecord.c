@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
-#include <signal.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -18,6 +17,7 @@
 #include "file_io.h"
 #include "common.h"
 #include "debug.h"
+#include "utils.h"
 
 static const unsigned sector_size = 512u;
 
@@ -832,7 +832,7 @@ static void blkrecord(struct blkio_record_context *ctx)
 	ERR("completes: %lu\n", events_total - queues);
 }
 
-static void handle_signal(int sig)
+static void finish_blkrecord(int sig)
 {
 	(void)sig;
 	done = 1;
@@ -878,10 +878,10 @@ int main(int argc, char **argv)
 	}
 
 
-	signal(SIGINT, handle_signal);
-	signal(SIGHUP, handle_signal);
-	signal(SIGTERM, handle_signal);
-	signal(SIGALRM, handle_signal);
+	handle_signal(SIGINT, finish_blkrecord);
+	handle_signal(SIGHUP, finish_blkrecord);
+	handle_signal(SIGTERM, finish_blkrecord);
+	handle_signal(SIGALRM, finish_blkrecord);
 
 	blkio_record_context_init(&ctx);
 	ctx.zofd = zofd;

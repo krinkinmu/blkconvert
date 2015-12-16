@@ -6,12 +6,10 @@
 #include <errno.h>
 #include <time.h>
 
-#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
-#include <netdb.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <endian.h>
@@ -27,6 +25,8 @@
 #include "file_io.h"
 #include "common.h"
 #include "debug.h"
+#include "utils.h"
+#include "network.h"
 
 static const unsigned long long NS = 1000000000ull;
 
@@ -499,12 +499,12 @@ static void __play_pids(gzFile zfd, struct play_process *p, unsigned size)
 		}
 
 		parent = 0;
+		
 		if (blkio_stats_write(p[parent].fd, &stats))
 			break;
 
 		p[parent].end_time = stats.end_time;
 		while (parent < size) {
-			struct play_process tmp;
 			const size_t l = 2 * (parent + 1) - 1;
 			const size_t r = 2 * (parent + 1);
 			size_t swap = parent;
@@ -518,7 +518,8 @@ static void __play_pids(gzFile zfd, struct play_process *p, unsigned size)
 			if (swap == parent)
 				break;
 
-			tmp = p[parent];
+			struct play_process tmp = p[parent];
+
 			p[parent] = p[swap];
 			p[swap] = tmp;
 			parent = swap;
@@ -573,6 +574,7 @@ static void play_pids(gzFile zfd, int pool_size)
 	if (!fail) {
 		ERR("Start playing\n");
 		__play_pids(zfd, player, pool_size);
+		ERR("Finished\n");
 		for (int i = 0; i != pool_size; ++i)
 			close(player[i].fd);
 	}
@@ -657,10 +659,23 @@ static void find_and_play_pids(void)
 	gzclose(zfd);
 }
 
-static void handle_signal(int sig)
+static void finish_blkplay(int sig)
 {
 	(void)sig;
 	done = 1;
+}
+
+static void reclaim_child(int sig)
+{
+	(void) sig;
+
+	while (1) {
+		int status;
+		pid_t pid = waitpid(-1, &status, WNOHANG);
+
+		if (!pid || (pid == -1 && errno != EINTR))
+			break;
+	}
 }
 
 #define PLAY_CMD_MAX_LENGTH    4096
@@ -680,6 +695,7 @@ static void handle_connection(int fd)
 	const int sz = sizeof(struct play_cmd_header);
 	char buffer[PLAY_CMD_MAX_LENGTH];
 
+	ERR("Handle input connection\n");
 	if (myread(fd, buffer, sz)) {
 		ERR("Cannot read command header\n");
 		close(fd);
@@ -689,6 +705,7 @@ static void handle_connection(int fd)
 	struct play_cmd_header header;
 
 	memcpy((char *)&header, buffer, sz);
+
 	header.size = le32toh(header.size);
 	header.events = le32toh(header.events);
 	header.pool = le32toh(header.pool);
@@ -709,64 +726,51 @@ static void handle_connection(int fd)
 	time_accurate = (header.accurate != 0);
 	keep_io_delay = (header.delay != 0);
 
-	if (header.pool >= MAX_PLAY_PROCESSES) {
-		ERR("Reqeusted pool is too large\n");
+	io_engine = io_engine_find(io_engine_name);
+	if (!io_engine) {
+		ERR("Engine %s is'n supported\n", io_engine_name);
 		close(fd);
 		return;
 	}
 
-	gzFile zfd = gzdopen(fd, "rb");
-	if (zfd) {
-		play_pids(zfd, header.pool);
-		gzclose(zfd);
+	if (header.pool >= MAX_PLAY_PROCESSES) {
+		ERR("Requested pool is too large\n");
+		close(fd);
+		return;
+	}
+
+	ERR("device: %s\n", block_device_name);
+	ERR("engine: %s\n", io_engine_name);
+	ERR("events: %d\n", number_of_events);
+	ERR("pool: %d\n", header.pool);
+	ERR("accurate: %d\n", time_accurate);
+	ERR("io delay: %d\n", keep_io_delay);
+
+	gzFile izfd = gzdopen(fd, "rb");
+	if (izfd) {
+		play_pids(izfd, header.pool);
+		gzclose(izfd);
 	} else {
 		ERR("Cannot allocate zlib buffer\n");
+		close(fd);
 	}
 }
 
 static void blkplay_server(void)
 {
-	ERR("blkplayd started\n");
-
-	struct addrinfo hints;
-
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_PASSIVE;
-
-	struct addrinfo *res;
-
-	if (getaddrinfo(NULL, service, &hints, &res) != 0) {
-		ERR("getaddrinfo failed\n");
-		return;
-	}
-
-	int fd = -1;
-
-	for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
-		fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-		if (fd == -1)
-			continue;
-
-		if (bind(fd, p->ai_addr, p->ai_addrlen) == -1) {
-			close(fd);
-			continue;
-		}
-
-		if (listen(fd, 1) == 0)
-			break;
-
-		close(fd);
-	}
+	int fd = server_socket(service, SOCK_STREAM);
 
 	if (fd == -1) {
 		ERR("Cannot create server socket\n");
 		return;
 	}
 
-	freeaddrinfo(res);
+	if (listen(fd, 1)) {
+		perror("Listen failed\n");
+		return;
+	}
 
+	ERR("blkplayd started\n");
 	while (!done) {
 		struct sockaddr_storage addr;
 		socklen_t len = sizeof(addr);
@@ -777,7 +781,7 @@ static void blkplay_server(void)
 			pid_t pid = fork();
 
 			if (pid < 0)
-				ERR("Failed to fork to handle connection\n");
+				ERR("Failed to fork worker process\n");
 
 			if (pid == 0) {
 				close(fd);
@@ -788,7 +792,6 @@ static void blkplay_server(void)
 		}
 	}
 	close(fd);
-
 	ERR("blkplayd finished\n");
 }
 
@@ -798,34 +801,34 @@ static void run_server(void)
 
 	if (pid < 0) {
 		ERR("Cannot create daemon process\n");
-		exit(1);
+		return;
 	}
 
 	if (pid > 0)
-		exit(0);
+		return;
 
 	pid_t sid = setsid();
+
 	if (sid < 0) {
 		ERR("Cannot create a new session\n");
-		exit(1);
+		return;
 	}
 
 	fclose(stdin);
 	fclose(stdout);
 
-	signal(SIGINT, handle_signal);
-	signal(SIGHUP, handle_signal);
-	signal(SIGTERM, handle_signal);
-	signal(SIGALRM, handle_signal);
+	handle_signal(SIGINT, finish_blkplay);
+	handle_signal(SIGHUP, finish_blkplay);
+	handle_signal(SIGTERM, finish_blkplay);
+	handle_signal(SIGALRM, finish_blkplay);
+	handle_signal(SIGCHLD, reclaim_child);
 
 	openlog("blkplayd", 0, 0);
 	redirect_to_syslog(&stderr);
-
 	if (chdir("/"))
 		ERR("Cannot change dir to \"/\" (%d)", errno);
 	else
 		blkplay_server();
-
 	closelog();
 }
 
@@ -840,7 +843,7 @@ static void send_stats(gzFile izfd, gzFile ozfd)
 			continue;
 
 		if (blkio_zstats_write(ozfd, &stats))
-			break;	
+			break;
 	}
 }
 
@@ -855,13 +858,12 @@ static void run_client(void)
 	int size = sz + dev_len + engine_len + 2;
 
 	memset(buffer, 0, PLAY_CMD_MAX_LENGTH);
-
 	header.size = htole32(size);
 	header.events = htole32(number_of_events);
 	header.accurate = time_accurate;
 	header.delay = keep_io_delay;
-	header.device = sz;
-	header.engine = sz + dev_len + 1;
+	header.device = htole32(sz);
+	header.engine = htole32(sz + dev_len + 1);
 
 	gzFile zfd = gzopen(input_file_name, "rb");
 
@@ -877,43 +879,19 @@ static void run_client(void)
 	memcpy(buffer + sz, block_device_name, dev_len + 1);
 	memcpy(buffer + sz + dev_len + 1, io_engine_name, engine_len + 1);
 
-	
-	struct addrinfo hints;
-
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-
-	struct addrinfo *res;
-
-	if (getaddrinfo(node, service, &hints, &res) != 0) {
-		ERR("getaddrinfo failed\n");
-		return;
-	}
-
-	int fd = -1;
-
-	for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
-		fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-		if (fd == -1)
-			continue;
-
-		if (connect(fd, p->ai_addr, p->ai_addrlen) != -1)
-			break;
-
-		close(fd);
-	}
+	int fd = client_socket(node, service, SOCK_STREAM);
 
 	if (fd == -1) {
 		ERR("Cannot connect to server\n");
+		gzclose(zfd);
 		return;
 	}
 
-	freeaddrinfo(res);
-
 	if (mywrite(fd, buffer, size)) {
 		ERR("Failed to send play commad\n");
+		gzclose(zfd);
 		close(fd);
+		return;
 	}
 
 	gzFile ozfd = gzdopen(fd, "wb");
