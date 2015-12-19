@@ -19,6 +19,9 @@ static inline intmax_t __max(intmax_t l, intmax_t r)
 static inline uintmax_t __maxu(uintmax_t l, uintmax_t r)
 { return MAX_CONST(l, r); }
 
+#undef MIN
+#undef MAX
+
 #define MIN(a, b)  __min(a, b)
 #define MINU(a, b) __minu(a, b)
 #define MAX(a, b)  __max(a, b)
