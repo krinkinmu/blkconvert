@@ -3,12 +3,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
 
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/param.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <byteswap.h>
+#include <poll.h>
 
 #include "blktrace_api.h"
 #include "blkrecord.h"
@@ -20,29 +24,34 @@
 #include "utils.h"
 
 static const unsigned sector_size = 512u;
+static const int action_mask = BLK_TC_QUEUE | BLK_TC_COMPLETE;
+static const char *debugfs_root_path = "/sys/kernel/debug";
 
+static const char *block_device_name;
 static const char *input_file_name;
 static const char *output_file_name;
-static unsigned min_time_interval = 1000u;
-static int binary = 1;
 static int per_process, per_cpu;
+
+static unsigned long min_time_interval = 1000ul;
+static unsigned long buffer_size = 512 * 1024ul;
+static unsigned long buffer_count = 4ul;
 
 static volatile sig_atomic_t done;
 
 static void show_usage(const char *name)
 {
 	static const char *usage = "\n\n" \
-		"[-f <input file>    | --file=<input file>]\n" \
-		"[-o <output file>   | --output=<output file>]\n" \
-		"[-i <time interval> | --interval=<time interval>]\n" \
-		"[-c                 | --per-cpu]\n" \
-		"[-t                 | --text]\n" \
-		"[-p                 | --per-process]\n" \
-		"\t-f Use specified blktrace file. Default: stdin\n" \
+		"-f <input file>    | --file=<input file>\n" \
+		"-d <block device>  | --device=<block device>\n" \
+		"-o <output file>   | --output=<output file>\n" \
+		"-i <time interval> | --interval=<time interval>\n" \
+		"-c                 | --per-cpu\n" \
+		"-p                 | --per-process\n" \
+		"\t-f Use specified blktrace file.\n" \
+		"\t-d Block device to trace.\n" \
 		"\t-o Ouput file. Default: stdout\n" \
 		"\t-i Minimum sampling time interval in ms. Default: 1000\n" \
 		"\t-c Gather per CPU stats.\n" \
-		"\t-t Output in text format, by default output is binary.\n" \
 		"\t-p Gather per process stats.\n";
 
 	ERR("Usage: %s %s", name, usage);		
@@ -56,6 +65,12 @@ static int parse_args(int argc, char **argv)
 			.has_arg = required_argument,
 			.flag = NULL,
 			.val = 'f'
+		},
+		{
+			.name = "device",
+			.has_arg = required_argument,
+			.flag = NULL,
+			.val = 'd'
 		},
 		{
 			.name = "output",
@@ -76,12 +91,6 @@ static int parse_args(int argc, char **argv)
 			.val = 'c'
 		},
 		{
-			.name = "text",
-			.has_arg = no_argument,
-			.flag = NULL,
-			.val = 't'
-		},
-		{
 			.name = "per-process",
 			.has_arg = no_argument,
 			.flag = NULL,
@@ -91,7 +100,7 @@ static int parse_args(int argc, char **argv)
 			.name = NULL
 		}
 	};
-	static const char *opts = "f:o:i:ctp";
+	static const char *opts = "f:d:o:i:cp";
 
 	long i;
 	int c;
@@ -100,6 +109,9 @@ static int parse_args(int argc, char **argv)
 		switch (c) {
 		case 'f':
 			input_file_name = optarg;
+			break;
+		case 'd':
+			block_device_name = optarg;
 			break;
 		case 'o':
 			output_file_name = optarg;
@@ -115,9 +127,6 @@ static int parse_args(int argc, char **argv)
 		case 'c':
 			per_cpu = 1;
 			break;
-		case 't':
-			binary = 0;
-			break;
 		case 'p':
 			per_process = 1;
 			break;
@@ -126,6 +135,22 @@ static int parse_args(int argc, char **argv)
 			return 1;
 		}
 	}
+
+	if (!block_device_name && !block_device_name) {
+		ERR("Specify either input file or block device\n");
+		return 1;
+	}
+
+	if (block_device_name && block_device_name) {
+		ERR("Specify either input file or block device\n");
+		return 1;
+	}
+
+	if (!output_file_name) {
+		ERR("Specify output file name\n");
+		return 1;
+	}
+
 	return 0;
 }
 
@@ -273,41 +298,10 @@ static int mygzwrite(gzFile zfd, const char *buf, size_t size)
 static int blkio_stats_dump(struct blkio_record_context *ctx,
 			const struct blkio_stats *st)
 {
-	unsigned long long first = ~0ull, last = 0ull;
-	char buffer[512];
-
 	if (st->reads + st->writes == 0)
 		return 0;
 
-	if (binary)
-		return mygzwrite(ctx->zofd, (const char *)st, sizeof(*st));
-
-	if (st->reads) {
-		first = MIN(first, st->reads_layout.first_sector);
-		last = MAX(last, st->reads_layout.last_sector);
-	}
-
-	if (st->writes) {
-		first = MIN(first, st->writes_layout.first_sector);
-		last = MAX(last, st->writes_layout.last_sector);
-	}
-
-	snprintf(buffer, 512, "pid=%lu cpu=%lu begin=%llu end=%llu "
-				"inversions=%llu reads=%lu writes=%lu "
-				"avg_iodepth=%lu avg_batch=%lu "
-				"first_sec=%llu last_sec=%llu\n",
-				(unsigned long)st->pid,
-				(unsigned long)st->cpu,
-				(unsigned long long)st->begin_time,
-				(unsigned long long)st->end_time,
-				(unsigned long long)st->inversions,
-				(unsigned long)st->reads,
-				(unsigned long)st->writes,
-				(unsigned long)st->iodepth,
-				(unsigned long)st->batch,
-				first, last);
-
-	return mywrite(ctx->ofd, buffer, strlen(buffer));
+	return mygzwrite(ctx->zofd, (const char *)st, sizeof(*st));
 }
 
 struct blkio_run {
@@ -838,50 +832,38 @@ static void finish_blkrecord(int sig)
 	done = 1;
 }
 
-int main(int argc, char **argv)
+static void traces_from_file(void)
 {
-	struct blkio_record_context ctx;
-	int ifd = 0, ofd = 1;
-	gzFile zofd = NULL;
+	int ifd = open(input_file_name, 0);
 
-	if (parse_args(argc, argv))
-		return 1;
-
-	if (input_file_name && strcmp("-", input_file_name)) {
-		ifd = open(input_file_name, 0);
-		if (ifd < 0) {
-			perror("Cannot open input file");
-			return 1;
-		}
+	if (ifd < 0) {
+		perror("Cannot open input file");
+		return;
 	}
 
-	if (output_file_name && strcmp("-", output_file_name)) {
-		ofd = open(output_file_name, O_CREAT | O_TRUNC | O_WRONLY,
-			S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
-		if (ofd < 0) {
-			close(ifd);
-			perror("Cannot open output file");
-			return 1;
-		}
-
+	int ofd = open(output_file_name, O_CREAT | O_TRUNC | O_WRONLY,
+		S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+	if (ofd < 0) {
+		close(ifd);
+		perror("Cannot open output file");
+		return;
 	}
 
-	if (binary) {
-		zofd = gzdopen(ofd, "wb");
+	gzFile zofd = gzdopen(ofd, "wb");
 
-		if (!zofd) {
-			ERR("Cannot allocate enough memory for zlib\n");
-			close(ifd);
-			close(ofd);
-			return 1;
-		}
+	if (!zofd) {
+		ERR("Cannot allocate enough memory for zlib\n");
+		close(ifd);
+		close(ofd);
+		return;
 	}
-
 
 	handle_signal(SIGINT, finish_blkrecord);
 	handle_signal(SIGHUP, finish_blkrecord);
 	handle_signal(SIGTERM, finish_blkrecord);
 	handle_signal(SIGALRM, finish_blkrecord);
+
+	struct blkio_record_context ctx;
 
 	blkio_record_context_init(&ctx);
 	ctx.zofd = zofd;
@@ -890,11 +872,121 @@ int main(int argc, char **argv)
 	blkrecord(&ctx);
 	blkio_record_context_finit(&ctx);
 
-	if (zofd)
-		gzclose(zofd);
-	else
-		close(ofd);
+	gzclose(zofd);
 	close(ifd);
+}
+
+struct blktrace_ctx {
+	struct blk_user_trace_setup conf;
+	struct pollfd *pfds;
+	int cpus;
+	int fd;
+};
+
+static void blktrace_ctx_release(struct blktrace_ctx *ctx)
+{
+	if (ctx->fd <= 0)
+		return;
+
+	ioctl(ctx->fd, BLKTRACETEARDOWN);
+
+	if (ctx->pfds) {
+		for (int i = 0; i != ctx->cpus; ++i) {
+			if (ctx->pfds[i].fd <= 0)
+				break;
+			close(ctx->pfds[i].fd);
+		}
+		free(ctx->pfds);
+	}
+
+	close(ctx->fd);
+}
+
+static int blktrace_ctx_setup(struct blktrace_ctx *ctx)
+{
+	char filename[MAXPATHLEN + 64];
+
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->conf.act_mask = action_mask;
+	ctx->conf.buf_size = buffer_size;
+	ctx->conf.buf_nr = buffer_count;
+
+	ctx->cpus = sysconf(_SC_NPROCESSORS_CONF);
+	if (ctx->cpus < 0) {
+		ERR("sysconf(_SC_NPROCESSORS_CONF) failed with %d\n", errno);
+		return 1;
+	}
+
+	ctx->fd = open(block_device_name, O_RDONLY | O_NONBLOCK);
+	if (ctx->fd < 0) {
+		ERR("Cannot open device %s (%d)\n", block_device_name, errno);
+		return 1;
+	}
+
+	ctx->pfds = calloc(ctx->cpus, sizeof(*ctx->pfds));
+	if (!ctx->pfds) {
+		ERR("Cannot allocate poll descriptors\n");
+		blktrace_ctx_release(ctx);
+		return 1;
+	}
+
+	if (ioctl(ctx->fd, BLKTRACESETUP, &ctx->conf) < 0) {
+		ERR("Cannot setup blktrace\n");
+		blktrace_ctx_release(ctx);
+		return 1;
+	}
+
+	for (int i = 0; i != ctx->cpus; ++i) {
+		snprintf(filename, sizeof(filename), "%s/block/%s/trace%d",
+			debugfs_root_path, ctx->conf.name, i);
+
+		ctx->pfds[i].fd = open(filename, O_RDONLY | O_NONBLOCK);
+		if (ctx->pfds[i].fd < 0) {
+			blktrace_ctx_release(ctx);
+			return 1;
+		}
+		ctx->pfds[i].events = POLLIN;
+	}
+
+	return 0;
+}
+
+static int blktrace_start(struct blktrace_ctx *ctx)
+{
+	if (ioctl(ctx->fd, BLKTRACESTART) < 0) {
+		ERR("BLKTRACESTART failed with error (%d)\n", errno);
+		return 1;
+	}
+
+	return 0;
+}
+
+static void blktrace_stop(struct blktrace_ctx *ctx)
+{ ioctl(ctx->fd, BLKTRACESTOP); }
+
+static void traces_from_device(void)
+{
+	struct blktrace_ctx ctx;
+
+	if (blktrace_ctx_setup(&ctx))
+		return;
+	
+	if (!blktrace_start(&ctx)) {
+		blktrace_stop(&ctx);
+	}
+
+	blktrace_ctx_release(&ctx);
+}
+
+int main(int argc, char **argv)
+{
+	if (parse_args(argc, argv))
+		return 1;
+
+	if (input_file_name)
+		traces_from_file();
+	else
+		traces_from_device();
 
 	return 0;
 }
