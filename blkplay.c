@@ -467,7 +467,7 @@ static unsigned long long current_time(void)
 
 struct play_process {
 	unsigned long long end_time;
-	unsigned long pid;
+	pid_t pid;
 	int fd;
 };
 
@@ -535,10 +535,11 @@ static void play_pids(gzFile zfd, int pool_size)
 	for (int i = 0; i != pool_size; ++i) {
 		player[i].end_time = 0;
 		player[i].fd = -1;
+		player[i].pid = -1;
 	}
 
 	for (int i = 0; i != pool_size; ++i) {
-		int pfds[2], ret;
+		int pfds[2];
 
 		if (pipe(pfds)) {
 			perror("Cannot create pipe for play process");
@@ -549,8 +550,8 @@ static void play_pids(gzFile zfd, int pool_size)
 		}
 
 		player[i].fd = pfds[1];
-		ret = fork();
-		if (ret < 0) {
+		player[i].pid = fork();
+		if (player[i].pid < 0) {
 			perror("Cannot create play process");
 			fail = 1;
 			close(pfds[0]);
@@ -560,8 +561,7 @@ static void play_pids(gzFile zfd, int pool_size)
 			break;
 		}
 
-		player[i].pid = ret;
-		if (!ret) {
+		if (!player[i].pid) {
 			for (int j = 0; j != i; ++j)
 				close(player[j].fd);
 			close(pfds[1]);
@@ -579,8 +579,11 @@ static void play_pids(gzFile zfd, int pool_size)
 			close(player[i].fd);
 	}
 
-	for (int i = 0; i != pool_size; ++i)
+	for (int i = 0; i != pool_size; ++i) {
+		if (player[i].pid < 0)
+			break;
 		waitpid(player[i].pid, NULL, 0);
+	}
 }
 
 static int count_pool_size(gzFile zfd)

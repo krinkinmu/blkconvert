@@ -25,11 +25,13 @@ struct object_cache *object_cache_create(size_t object_size)
 
 void object_cache_finit(struct object_cache *cache)
 {
-	while (!list_empty(&cache->head)) {
-		struct list_head *head = cache->head.next;
+	struct list_head *head = &cache->head;
 
-		list_unlink(head);
-		free(head);
+	for (struct list_head *ptr = head->next; ptr != head;) {
+		struct list_head *tmp = ptr;
+
+		ptr = ptr->next;
+		free(tmp);
 	}
 }
 

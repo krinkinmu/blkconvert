@@ -79,7 +79,7 @@ static int aio_open(struct io_context *ctx, const char *device_file_name,
 
 	struct aio_ctx *aio = malloc(sizeof(*aio));
 
-	if (!ctx) {
+	if (!aio) {
 		ERR("Cannot allocate aio_ctx structure\n");
 		return 1;
 	}

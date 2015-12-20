@@ -116,6 +116,7 @@ static int usio_open(struct io_context *ctx, const char *device_file_name,
 		close(ufd);
 		close(bfd);
 		free(usio);
+		return 1;
 	}
 
 	memset(usio->event, 0, usio->size * sizeof(*usio->event));
