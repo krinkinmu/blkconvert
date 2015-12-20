@@ -78,7 +78,6 @@ struct blkio_record_context {
 	struct list_head head;
 	struct blkio_queue read, write;
 	gzFile zofd;
-	int ifd, ofd;
 };
 
 static inline void blkio_record_context_init(struct blkio_record_context *ctx)

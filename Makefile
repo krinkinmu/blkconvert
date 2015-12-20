@@ -1,12 +1,12 @@
 CC      ?= gcc
-CFLAGS  ?= -std=c99 -O3 -Wall -Wextra -Werror -D_GNU_SOURCE
+CFLAGS  ?= -g -std=c99 -O3 -Wall -Wextra -Werror -D_GNU_SOURCE
 LDFLAGS ?= 
 
 BLKPLAY_LDFLAGS   := $(LDFLAGS) -laio -lz
 BLKRECORD_LDFLAGS := $(LDFLAGS) -lz
 
 COMMON_SRC := algorithm.c object_cache.c file_io.c ctree.c list.c rbtree.c \
-	debug.c utils.c network.c
+	debug.c utils.c network.c cbuffer.c
 COMMON_DEP := $(COMMON_SRC:.c=.d)
 COMMON_OBJ := $(COMMON_SRC:.c=.o)
 
