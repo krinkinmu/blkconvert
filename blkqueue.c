@@ -9,8 +9,20 @@ void blkio_queue_init(struct blkio_queue *q)
 	object_cache_init(&q->cache, sizeof(struct blkio));
 }
 
+static void blkio_tree_release(struct object_cache *cache, struct rb_node *node)
+{
+	while (node) {
+		struct blkio *tmp = (struct blkio *)node;
+
+		blkio_tree_release(cache, node->rb_right);
+		node = node->rb_left;
+		object_cache_free(cache, tmp);
+	}
+}
+
 void blkio_queue_finit(struct blkio_queue *q)
 {
+	blkio_tree_release(&q->cache, q->rb_root.rb_node);
 	object_cache_finit(&q->cache);
 	memset(q, 0, sizeof(*q));
 }
