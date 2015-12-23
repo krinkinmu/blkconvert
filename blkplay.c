@@ -62,22 +62,22 @@ static void show_usage(const char *name)
 	static const char *usage = "\n\n" \
 		" -d <device>           | --device=<device>\n" \
 		" -f <input file>       | --file=<input file>\n" \
-		"[-e <number of events> | --events=<number of events>]\n" \
-		"[-p <pid>              | --pid=<pid>]\n" \
-		"[-g <io engine>        | --engine=<io engine>]\n"
-		"[-h <host>             | --host=<host>]\n" \
-		"[-s <port>             | --port=<port>]\n" \
-		"[-i                    | --keep_io_delay]\n" \
-		"[-t                    | --time]\n" \
-		"[-c                    | --client]\n" \
-		"[-b                    | --server]\n" \
+		"-e <number of events> | --events=<number of events>\n" \
+		"-p <pid>              | --pid=<pid>\n" \
+		"-g <io engine>        | --engine=<io engine>\n"
+		"-h <host>             | --host=<host>\n" \
+		"-s <port>             | --port=<port>\n" \
+		"-i                    | --keep_io_delay\n" \
+		"-t                    | --time\n" \
+		"-c                    | --client\n" \
+		"-b                    | --server\n" \
 		"\t-d Block device file. Must be specified.\n" \
 		"\t-f Use specified blkrecord file. Default: stdin\n" \
 		"\t-e Max number of concurrently processing events. Default: 512\n" \
 		"\t-p Process PID to play.\n" \
 		"\t-g IO engine to play. Default: usio.\n" \
-		"\t-h Host name/address to use with client/server options.\n" \
-		"\t-s Port to use with client/server options.\n" \
+		"\t-h Host name/address to connect.\n" \
+		"\t-s Port to connect/listen.\n" \
 		"\t-i Keep time interval between IO.\n" \
 		"\t-t Time accurate playing.\n" \
 		"\t-c Client mode.\n" \
@@ -903,6 +903,7 @@ static void run_client(void)
 		gzclose(ozfd);
 	} else {
 		ERR("Cannot allocate zlib buffer\n");
+		close(fd);
 	}
 	gzclose(zfd);
 }
