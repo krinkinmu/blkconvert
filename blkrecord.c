@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/param.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -18,6 +19,7 @@
 #include "blkrecord.h"
 #include "algorithm.h"
 #include "blkqueue.h"
+#include "network.h"
 #include "cbuffer.h"
 #include "file_io.h"
 #include "common.h"
@@ -37,6 +39,16 @@ static unsigned long min_time_interval = 1000ul;
 static unsigned long buffer_size = 512 * 1024ul;
 static unsigned long buffer_count = 4ul;
 
+enum blkrecord_mode {
+	BM_HOST,
+	BM_SERVER,
+	BM_CLIENT
+};
+
+static int record_mode;
+static const char *node;
+static const char *service;
+
 static volatile sig_atomic_t done;
 
 static void show_usage(const char *name)
@@ -46,14 +58,22 @@ static void show_usage(const char *name)
 		"-d <block device>  | --device=<block device>\n" \
 		"-o <output file>   | --output=<output file>\n" \
 		"-i <time interval> | --interval=<time interval>\n" \
-		"-c                 | --per-cpu\n" \
+		"-h <host>          | --host=<host>\n" \
+		"-s <port>          | --port=<port>\n" \
+		"-u                 | --per-cpu\n" \
 		"-p                 | --per-process\n" \
+		"-c                 | --client\n" \
+		"-b                 | --server\n" \
 		"\t-f Use specified blktrace file.\n" \
 		"\t-d Block device to trace.\n" \
 		"\t-o Ouput file. Default: stdout\n" \
 		"\t-i Minimum sampling time interval in ms. Default: 1000\n" \
-		"\t-c Gather per CPU stats.\n" \
-		"\t-p Gather per process stats.\n";
+		"\t-h Host name/address to connect\n" \
+		"\t-s Port to connect/listen\n" \
+		"\t-u Gather per CPU stats.\n" \
+		"\t-p Gather per process stats.\n" \
+		"\t-c Client mode.\n" \
+		"\t-b Server mode.\n";
 
 	ERR("Usage: %s %s", name, usage);		
 }
@@ -86,10 +106,22 @@ static int parse_args(int argc, char **argv)
 			.val = 'i'
 		},
 		{
+			.name = "host",
+			.has_arg = required_argument,
+			.flag = NULL,
+			.val = 'h'
+		},
+		{
+			.name = "port",
+			.has_arg = required_argument,
+			.flag = NULL,
+			.val = 's'
+		},
+		{
 			.name = "per-cpu",
 			.has_arg = no_argument,
 			.flag = NULL,
-			.val = 'c'
+			.val = 'u'
 		},
 		{
 			.name = "per-process",
@@ -98,10 +130,22 @@ static int parse_args(int argc, char **argv)
 			.val = 'p'
 		},
 		{
+			.name = "client",
+			.has_arg = no_argument,
+			.flag = NULL,
+			.val = 'c'
+		},
+		{
+			.name = "server",
+			.has_arg = no_argument,
+			.flag = NULL,
+			.val = 'b'
+		},
+		{
 			.name = NULL
 		}
 	};
-	static const char *opts = "f:d:o:i:cp";
+	static const char *opts = "f:d:o:i:h:s:upcb";
 
 	long i;
 	int c;
@@ -125,29 +169,61 @@ static int parse_args(int argc, char **argv)
 			}
 			min_time_interval = i;
 			break;
-		case 'c':
+		case 'h':
+			node = optarg;
+			break;
+		case 's':
+			service = optarg;
+			break;
+		case 'u':
 			per_cpu = 1;
 			break;
 		case 'p':
 			per_process = 1;
+			break;
+		case 'c':
+			record_mode = BM_CLIENT;
+			break;
+		case 'b':
+			record_mode = BM_SERVER;
 			break;
 		default:
 			return 1;
 		}
 	}
 
-	if (!block_device_name && !input_file_name) {
-		ERR("Specify either input file or block device\n");
+	if (record_mode == BM_SERVER) {
+		if (!service) {
+			ERR("You must specify port in server mode\n");
+			show_usage(argv[0]);
+			return 1;
+		}
+		return 0;
+	}
+
+	if (record_mode == BM_CLIENT && (!service || !node)) {
+		ERR("You must specify remote host and port in client mode\n");
+		show_usage(argv[0]);
 		return 1;
 	}
 
-	if (block_device_name && input_file_name) {
-		ERR("Specify either input file or block device\n");
+	if (record_mode == BM_CLIENT && !block_device_name) {
+		ERR("You must specify block device\n");
+		show_usage(argv[0]);
 		return 1;
 	}
 
-	if (!output_file_name) {
-		ERR("Specify output file name\n");
+	if (record_mode == BM_HOST &&
+				(!block_device_name && !input_file_name)) {
+		ERR("Specify either input file or block device\n");
+		show_usage(argv[0]);
+		return 1;
+	}
+
+	if ((record_mode == BM_CLIENT || record_mode == BM_HOST) &&
+				!output_file_name) {
+		ERR("You must specify output file name\n");
+		show_usage(argv[0]);
 		return 1;
 	}
 
@@ -827,6 +903,19 @@ static void finish_blkrecord(int sig)
 	done = 1;
 }
 
+static void reclaim_child(int sig)
+{
+	(void) sig;
+
+	while (1) {
+		int status;
+		pid_t pid = waitpid(-1, &status, WNOHANG);
+
+		if (!pid || (pid == -1 && errno != EINTR))
+			break;
+	}
+}
+
 static void traces_from_file(struct blkio_record_context *ctx)
 {
 	int ifd = open(input_file_name, 0);
@@ -916,7 +1005,7 @@ static void blktrace_ctx_release(struct blktrace_ctx *ctx)
 	close(ctx->fd);
 }
 
-static int blktrace_ctx_setup(struct blktrace_ctx *ctx)
+static int blktrace_ctx_setup(struct blktrace_ctx *ctx, int fd)
 {
 	char filename[MAXPATHLEN + 64];
 
@@ -937,7 +1026,7 @@ static int blktrace_ctx_setup(struct blktrace_ctx *ctx)
 		return 1;
 	}
 
-	ctx->pfds = calloc(ctx->cpus, sizeof(*ctx->pfds));
+	ctx->pfds = calloc(ctx->cpus + 1, sizeof(*ctx->pfds));
 	if (!ctx->pfds) {
 		ERR("Cannot allocate poll descriptors\n");
 		blktrace_ctx_release(ctx);
@@ -977,6 +1066,9 @@ static int blktrace_ctx_setup(struct blktrace_ctx *ctx)
 		ctx->pfds[i].events = POLLIN;
 	}
 
+	ctx->pfds[ctx->cpus].fd = fd;
+	ctx->pfds[ctx->cpus].events = POLLIN;
+
 	return 0;
 }
 
@@ -1009,13 +1101,13 @@ static int dump_device_traces(struct cbuffer *buffer,
 }
 
 static void read_device_traces(struct blktrace_ctx *tctx,
-			struct blkio_record_context *rctx)
+			struct blkio_record_context *rctx, bool force)
 {
 	struct pollfd *pfd = tctx->pfds;
 	struct cbuffer *buf = tctx->bufs;
 
 	for (int i = 0; i != tctx->cpus; ++i) {
-		if ((pfd[i].revents & POLLIN) == 0)
+		if (!force && (pfd[i].revents & POLLIN) == 0)
 			continue;
 
 		ssize_t ret = cbuffer_fill(buf + i, pfd[i].fd);
@@ -1038,22 +1130,250 @@ static void read_device_traces(struct blktrace_ctx *tctx,
 	}
 }
 
-static void traces_from_device(struct blkio_record_context *rctx)
+static void traces_from_device(struct blkio_record_context *rctx, int fd)
 {
 	const int timeout = 500;
 	struct blktrace_ctx tctx;
 
-	if (blktrace_ctx_setup(&tctx))
+	if (blktrace_ctx_setup(&tctx, fd))
 		return;
 	
 	if (!blktrace_start(&tctx)) {
 		while (!done) {
-			if (poll(tctx.pfds, tctx.cpus, timeout) > 0)
-				read_device_traces(&tctx, rctx);
+			int ret = poll(tctx.pfds, tctx.cpus + 1, timeout);
+
+			if (ret <= 0)
+				continue;
+
+			if ((tctx.pfds[tctx.cpus].revents & POLLIN) != 0) {
+				ERR("Finishing\n");
+				break;
+			}
+
+			read_device_traces(&tctx, rctx, false);
 		}
 		blktrace_stop(&tctx);
+		read_device_traces(&tctx, rctx, true);
 	}
 	blktrace_ctx_release(&tctx);
+}
+
+#define RECORD_CMD_MAX_LENGTH 4096
+
+struct record_cmd_header {
+	__u32 size;
+	__u32 device;
+	__u32 interval;
+	__u32 per_process;
+	__u32 per_cpu;
+};
+
+static void handle_connection(int fd)
+{
+	const int sz = sizeof(struct record_cmd_header);
+	char buffer[RECORD_CMD_MAX_LENGTH];
+
+	ERR("Handle input connection\n");
+	if (myread(fd, buffer, sz)) {
+		ERR("Cannot read command header\n");
+		close(fd);
+		return;
+	}
+
+	struct record_cmd_header header;
+
+	memcpy((char *)&header, buffer, sz);
+
+	header.size = le32toh(header.size);
+	header.device = le32toh(header.device);
+	header.interval = le32toh(header.interval);
+	header.per_process = le32toh(header.per_process);
+	header.per_cpu = le32toh(header.per_cpu);
+
+	if (myread(fd, buffer + sz, header.size - sz)) {
+		ERR("Cannot read command header\n");
+		close(fd);
+		return;
+	}
+
+	block_device_name = buffer + header.device;
+	per_process = (header.per_process != 0);
+	per_cpu = (header.per_cpu != 0);
+
+	gzFile zofd = gzdopen(fd, "wb");
+	if (zofd) {
+		struct blkio_record_context ctx;
+		
+		blkio_record_context_init(&ctx);
+		ctx.zofd = zofd;
+
+		traces_from_device(&ctx, fd);
+
+		blkio_record_context_dump(&ctx, ~0ull);
+		blkio_record_context_finit(&ctx);
+		gzclose(zofd);
+	} else {
+		ERR("Cannot allocate zlib buffer\n");
+		close(fd);
+	}
+	ERR("Input connection closed\n");
+}
+
+static void blkrecord_server(void)
+{
+	int fd = server_socket(service, SOCK_STREAM);
+
+	if (fd == -1) {
+		ERR("Cannot create server socket\n");
+		return;
+	}
+
+	if (listen(fd, 1)) {
+		perror("Listen failed\n");
+		return;
+	}
+
+	ERR("blkrecordd started\n");
+	while (!done) {
+		struct sockaddr_storage addr;
+		socklen_t len = sizeof(addr);
+
+		int cfd = accept(fd, (struct sockaddr *)&addr, &len);
+
+		if (cfd != -1) {
+			pid_t pid = fork();
+
+			if (pid < 0)
+				ERR("Failed to fork worker process\n");
+
+			if (pid == 0) {
+				close(fd);
+				handle_connection(cfd);
+				return;
+			}
+			close(cfd);
+		}
+	}
+	close(fd);
+	ERR("blkrecordd finished\n");
+}
+
+static void run_server(void)
+{
+	pid_t pid = fork();
+
+	if (pid < 0) {
+		ERR("Cannot create daemon process\n");
+		return;
+	}
+
+	if (pid > 0)
+		return;
+
+	pid_t sid = setsid();
+
+	if (sid < 0) {
+		ERR("Cannot create a new session\n");
+		return;
+	}
+
+	fclose(stdin);
+	fclose(stdout);
+
+	handle_signal(SIGINT, finish_blkrecord);
+	handle_signal(SIGHUP, finish_blkrecord);
+	handle_signal(SIGTERM, finish_blkrecord);
+	handle_signal(SIGALRM, finish_blkrecord);
+	handle_signal(SIGCHLD, reclaim_child);
+
+	openlog("blkrecordd", 0, 0);
+	redirect_to_syslog(&stderr);
+	if (chdir("/"))
+		ERR("Cannot change dir to \"/\" (%d)", errno);
+	else
+		blkrecord_server();
+	closelog();
+}
+
+static void run_client(void)
+{
+	const int sz = sizeof(struct record_cmd_header);
+	char buffer[RECORD_CMD_MAX_LENGTH];
+
+	int dev_len = strlen(block_device_name);
+	int size = sz + dev_len + 1;
+
+	memset(buffer, 0, RECORD_CMD_MAX_LENGTH);
+
+	struct record_cmd_header header;
+
+	header.size = htole32(size);
+	header.device = htole32(sz);
+	header.interval = htole32(min_time_interval);
+	header.per_process = htole32(per_process);
+	header.per_cpu = htole32(per_cpu);
+
+	memcpy(buffer, &header, sz);
+	memcpy(buffer + sz, block_device_name, dev_len + 1);
+
+	int ofd = open(output_file_name, O_CREAT | O_TRUNC | O_WRONLY,
+		S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+
+	if (ofd == -1) {
+		ERR("Cannot create output file\n");
+		return;
+	}
+
+	int ifd = client_socket(node, service, SOCK_STREAM);
+
+	if (ifd == -1) {
+		ERR("Cannot connect to server\n");
+		close(ofd);
+		return;
+	}
+
+	if (mywrite(ifd, buffer, size)) {
+		ERR("Failed to send record command\n");
+		close(ifd);
+		close(ofd);
+		return;
+	}
+
+	handle_signal(SIGINT, finish_blkrecord);
+	handle_signal(SIGHUP, finish_blkrecord);
+	handle_signal(SIGTERM, finish_blkrecord);
+	handle_signal(SIGALRM, finish_blkrecord);
+
+	char buf[4096];
+	int ret;
+
+	while (!done) {
+		ret = read(ifd, buf, sizeof(buf));
+		if (ret == 0) {
+			ERR("Remote connection closed\n");
+			break;
+		}
+
+		if (ret > 0 && mywrite(ofd, buf, ret)) {
+			ERR("Failed to write received data to the file\n");
+			break;
+		}
+	}
+
+	ERR("Finishing\n");
+	mywrite(ifd, buffer, size);
+	ret = read(ifd, buf, sizeof(buf));
+	while (ret > 0) {
+		if (mywrite(ofd, buf, ret)) {
+			ERR("Failed to write received data to the file\n");
+			break;
+		}
+		ret = read(ifd, buf, sizeof(buf));
+	}
+	ERR("Finished\n");
+
+	close(ifd);
+	close(ofd);
 }
 
 int main(int argc, char **argv)
@@ -1063,20 +1383,31 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	handle_signal(SIGINT, finish_blkrecord);
-	handle_signal(SIGHUP, finish_blkrecord);
-	handle_signal(SIGTERM, finish_blkrecord);
-	handle_signal(SIGALRM, finish_blkrecord);
+	switch (record_mode) {
+	case BM_HOST: {
+		handle_signal(SIGINT, finish_blkrecord);
+		handle_signal(SIGHUP, finish_blkrecord);
+		handle_signal(SIGTERM, finish_blkrecord);
+		handle_signal(SIGALRM, finish_blkrecord);
 
+		struct blkio_record_context ctx;
 
-	struct blkio_record_context ctx;
+		if (!blkio_record_context_setup(&ctx)) {
+			if (input_file_name)
+				traces_from_file(&ctx);
+			else
+				traces_from_device(&ctx, -1);
+			blkio_record_context_release(&ctx);
+		}
 
-	if (!blkio_record_context_setup(&ctx)) {
-		if (input_file_name)
-			traces_from_file(&ctx);
-		else
-			traces_from_device(&ctx);
-		blkio_record_context_release(&ctx);
+		break;
+	}
+	case BM_CLIENT:
+		run_client();
+		break;
+	case BM_SERVER:
+		run_server();
+		break;
 	}
 
 	return 0;
