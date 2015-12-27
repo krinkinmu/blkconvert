@@ -23,6 +23,7 @@
 #include "cbuffer.h"
 #include "file_io.h"
 #include "common.h"
+#include "deamon.h"
 #include "debug.h"
 #include "utils.h"
 
@@ -619,8 +620,8 @@ static int account_general_stats(struct blkio_stats *stats,
 
 			++iodepth;
 
-			begin = MIN(begin, events[i].time);
-			end = MAX(end, events[i].time);
+			begin = MINU(begin, events[i].time);
+			end = MAXU(end, events[i].time);
 		} else {
 			if (i && IS_QUEUE(events[i - 1].type)) {
 				total_iodepth += iodepth;
@@ -1171,7 +1172,7 @@ struct record_cmd_header {
 static void handle_connection(int fd)
 {
 	const int sz = sizeof(struct record_cmd_header);
-	char buffer[RECORD_CMD_MAX_LENGTH];
+	static char buffer[RECORD_CMD_MAX_LENGTH];
 
 	ERR("Handle input connection\n");
 	if (myread(fd, buffer, sz)) {
@@ -1221,6 +1222,12 @@ static void handle_connection(int fd)
 
 static void blkrecord_server(void)
 {
+	handle_signal(SIGINT, finish_blkrecord);
+	handle_signal(SIGHUP, finish_blkrecord);
+	handle_signal(SIGTERM, finish_blkrecord);
+	handle_signal(SIGALRM, finish_blkrecord);
+	handle_signal(SIGCHLD, reclaim_child);
+
 	int fd = server_socket(service, SOCK_STREAM);
 
 	if (fd == -1) {
@@ -1256,43 +1263,6 @@ static void blkrecord_server(void)
 	}
 	close(fd);
 	ERR("blkrecordd finished\n");
-}
-
-static void run_server(void)
-{
-	pid_t pid = fork();
-
-	if (pid < 0) {
-		ERR("Cannot create daemon process\n");
-		return;
-	}
-
-	if (pid > 0)
-		return;
-
-	pid_t sid = setsid();
-
-	if (sid < 0) {
-		ERR("Cannot create a new session\n");
-		return;
-	}
-
-	fclose(stdin);
-	fclose(stdout);
-
-	handle_signal(SIGINT, finish_blkrecord);
-	handle_signal(SIGHUP, finish_blkrecord);
-	handle_signal(SIGTERM, finish_blkrecord);
-	handle_signal(SIGALRM, finish_blkrecord);
-	handle_signal(SIGCHLD, reclaim_child);
-
-	openlog("blkrecordd", 0, 0);
-	redirect_to_syslog(&stderr);
-	if (chdir("/"))
-		ERR("Cannot change dir to \"/\" (%d)", errno);
-	else
-		blkrecord_server();
-	closelog();
 }
 
 static void run_client(void)
@@ -1406,7 +1376,8 @@ int main(int argc, char **argv)
 		run_client();
 		break;
 	case BM_SERVER:
-		run_server();
+		if (deamon("blkrecordd", &blkrecord_server))
+			ERR("Cannot run deamon process (%d)\n", errno);
 		break;
 	}
 
