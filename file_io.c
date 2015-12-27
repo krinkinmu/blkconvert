@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <errno.h>
 #include <stdio.h>
 
 #include "file_io.h"
@@ -12,9 +13,10 @@ int myread(int fd, char *buf, size_t size)
 
 		if (ret < 0) {
 			perror("Error while reading file");
-			return 1;
+			return -1;
 		}
-		if (!ret) return 1;
+		if (!ret)
+			return -1;
 		rd += ret;
 	}
 	return 0;
@@ -29,7 +31,7 @@ int mywrite(int fd, const char *buf, size_t size)
 
 		if (ret < 0) {
 			perror("Error while writing file");
-			return 1;
+			return -1;
 		}
 		wr += ret;
 	}
