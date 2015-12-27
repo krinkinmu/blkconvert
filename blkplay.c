@@ -1,44 +1,48 @@
 #include <getopt.h>
-#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <errno.h>
+#include <stdio.h>
 #include <time.h>
 
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <sys/ioctl.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <endian.h>
+#include <fcntl.h>
 
 #include <zlib.h>
 
+#include "usio_engine.h"
+#include "aio_engine.h"
 #include "algorithm.h"
 #include "blkrecord.h"
 #include "io_engine.h"
 #include "generator.h"
-#include "usio_engine.h"
-#include "aio_engine.h"
 #include "file_io.h"
+#include "network.h"
+#include "deamon.h"
 #include "common.h"
 #include "debug.h"
 #include "utils.h"
-#include "network.h"
 
-static const unsigned long long NS = 1000000000ull;
 
-static const char *input_file_name;
-static const char *block_device_name;
-static const char *io_engine_name = "usio";
-static const struct io_engine *io_engine;
-static int number_of_events = 512;
-static int time_accurate;
-static int keep_io_delay;
+struct blkplay_config {
+	const char *input_file_name;
+	const char *block_device_name;
+	const char *io_engine_name;
+	const struct io_engine *io_engine;
+	int number_of_events;
+	int time_accurate;
+	int keep_io_delay;
+	int pool_size;
 
-static volatile sig_atomic_t done;
+	unsigned long *pid;
+	size_t pid_size;
+};
 
 enum blkplay_mode {
 	BM_HOST,
@@ -46,16 +50,24 @@ enum blkplay_mode {
 	BM_CLIENT
 };
 
+static const unsigned long long NS = 1000000000ull;
+static volatile sig_atomic_t done;
 static int play_mode;
 static const char *node;
 static const char *service;
 
-#define MAX_PIDS_SIZE       1024
-#define MAX_PLAY_PROCESSES  256
 
-static unsigned long pids_to_play[MAX_PIDS_SIZE];
-static unsigned pids_to_play_size;
+static void blkplay_config_add_pid(struct blkplay_config *conf,
+			unsigned long pid)
+{
+	static unsigned long default_pids_array[4096];
 
+	if (!conf->pid)
+		conf->pid = default_pids_array;
+
+	if (conf->pid_size != 4096)
+		conf->pid[conf->pid_size++] = pid;
+}
 
 static void show_usage(const char *name)
 {
@@ -106,7 +118,7 @@ static int pid_compare(unsigned long lpid, unsigned long rpid)
 	return 0;
 }
 
-static int parse_args(int argc, char **argv)
+static int parse_args(struct blkplay_config *conf, int argc, char **argv)
 {
 	static struct option long_opts[] = {
 		{
@@ -181,17 +193,17 @@ static int parse_args(int argc, char **argv)
 	};
 	static const char *opts = "d:e:f:p:g:h:s:itcb";
 
-	unsigned j;
 	long i;
-	int c, found;
+	int c;
 
+	memset(conf, 0, sizeof(*conf));
 	while ((c = getopt_long(argc, argv, opts, long_opts, NULL)) >= 0) {
 		switch (c) {
 		case 'd':
-			block_device_name = optarg;
+			conf->block_device_name = optarg;
 			break;
 		case 'f':
-			input_file_name = optarg;
+			conf->input_file_name = optarg;
 			break;
 		case 'e':
 			i = atol(optarg);
@@ -199,8 +211,7 @@ static int parse_args(int argc, char **argv)
 				ERR("Number of events must be positive\n");
 				return 1;
 			}
-
-			number_of_events = i;
+			conf->number_of_events = i;
 			break;
 		case 'p':
 			i = atol(optarg);
@@ -209,18 +220,10 @@ static int parse_args(int argc, char **argv)
 				return 1;
 			}
 
-			found = 0;
-			for (j = 0; j != pids_to_play_size; ++j) {
-				if (pids_to_play[j] == (unsigned long)i) {
-					found = 1;
-					break;
-				}
-			}
-			if (!found)
-				pids_to_play[pids_to_play_size++] = i;
+			blkplay_config_add_pid(conf, i);
 			break;
 		case 'g':
-			io_engine_name = optarg;
+			conf->io_engine_name = optarg;
 			break;
 		case 'h':
 			node = optarg;
@@ -229,10 +232,10 @@ static int parse_args(int argc, char **argv)
 			service = optarg;
 			break;
 		case 'i':
-			keep_io_delay = 1;
+			conf->keep_io_delay = 1;
 			break;
 		case 't':
-			time_accurate = 1;
+			conf->time_accurate = 1;
 			break;
 		case 'c':
 			play_mode = BM_CLIENT;
@@ -241,7 +244,6 @@ static int parse_args(int argc, char **argv)
 			play_mode = BM_SERVER;
 			break;
 		default:
-			show_usage(argv[0]);
 			return 1;
 		}
 	}
@@ -249,7 +251,6 @@ static int parse_args(int argc, char **argv)
 	if (play_mode == BM_SERVER) {
 		if (!service) {
 			ERR("You must specify port in server mode\n");
-			show_usage(argv[0]);
 			return 1;
 		}
 		return 0;
@@ -257,43 +258,40 @@ static int parse_args(int argc, char **argv)
 
 	if (play_mode == BM_CLIENT && (!service || !node)) {
 		ERR("You must specify remote host and port in client mode\n");
-		show_usage(argv[0]);
 		return 1;
 	}
 
-	if (!input_file_name) {
+	if (!conf->input_file_name) {
 		ERR("You must specify input file name\n");
-		show_usage(argv[0]);
 		return 1;
 	}
 
-	if (!block_device_name) {
+	if (!conf->block_device_name) {
 		ERR("You must specify block device name\n");
-		show_usage(argv[0]);
 		return 1;
 	}
 
-	io_engine = io_engine_find(io_engine_name);
-	if (!io_engine) {
-		ERR("Unsupported io engine %s\n", io_engine_name);
+	conf->io_engine = io_engine_find(conf->io_engine_name);
+	if (!conf->io_engine) {
+		ERR("Unsupported io engine %s\n", conf->io_engine_name);
 		return 1;
 	}
 
-	if (pids_to_play_size)
-		sort(pids_to_play, pids_to_play_size, &pid_compare);
+	if (conf->pid)
+		sort(conf->pid, conf->pid_size, &pid_compare);
 
 	return 0;
 }
 
-static int to_play(unsigned long pid)
+static int to_play(const struct blkplay_config *conf, unsigned long pid)
 {
 	size_t pos;
 
-	if (!pids_to_play_size)
+	if (!conf->pid_size)
 		return 1;
 
-	pos = lower_bound(pids_to_play, pids_to_play_size, pid, &pid_compare);
-	if (pos == pids_to_play_size || pids_to_play[pos] != pid)
+	pos = lower_bound(conf->pid, conf->pid_size, pid, &pid_compare);
+	if (pos == conf->pid_size || conf->pid[pos] != pid)
 		return 0;
 	return 1;
 }
@@ -323,7 +321,7 @@ static int blkio_zstats_read(gzFile zfd, struct blkio_stats *stats)
 				else
 					perror("Read failed");
 			}
-			return 1;
+			return -1;
 		}
 		read += ret;
 	}
@@ -347,7 +345,7 @@ static int blkio_zstats_write(gzFile zfd, const struct blkio_stats *stats)
 				ERR("zlib write failed: %s\n", msg);
 			else
 				perror("Write failed");
-			return 1;
+			return -1;
 		}
 		written += ret;
 	}
@@ -377,7 +375,8 @@ static void delay(unsigned long long ns)
  *
  * Returns 0, if success.
  */
-static int blkio_stats_play(struct io_context *ctx,
+static int blkio_stats_play(const struct blkplay_config *conf,
+			struct io_context *ctx,
 			const struct blkio_stats *stat)
 {
 	const int ios = stat->reads + stat->writes;
@@ -386,7 +385,7 @@ static int blkio_stats_play(struct io_context *ctx,
 
 	unsigned long long wait = 0;
 
-	if (keep_io_delay && ios > 1)
+	if (conf->keep_io_delay && ios > 1)
 		wait = (stat->end_time - stat->begin_time) / (ios - 1);
 
 	struct bio *bios = calloc(ios, sizeof(*bios));
@@ -416,7 +415,7 @@ static int blkio_stats_play(struct io_context *ctx,
 			break;
 		}
 
-		if (keep_io_delay)
+		if (conf->keep_io_delay)
 			delay(rc * wait);
 
 		s += rc;
@@ -438,20 +437,20 @@ static int blkio_stats_play(struct io_context *ctx,
 	return ret;
 }
 
-static void play(int fd)
+static void play(const struct blkplay_config *conf, int fd)
 {
 	struct blkio_stats stats;
 	struct io_context ctx;
 
-	int rc = io_engine_setup(&ctx, io_engine, block_device_name,
-				number_of_events);
+	int rc = io_engine_setup(&ctx, conf->io_engine, conf->block_device_name,
+				conf->number_of_events);
 	if (rc) {
 		ERR("Cannot create io context\n");
 		return;
 	}
 
 	while (!blkio_stats_read(fd, &stats)) {
-		if (blkio_stats_play(&ctx, &stats))
+		if (blkio_stats_play(conf, &ctx, &stats))
 			break;
 	}
 	io_engine_release(&ctx);
@@ -471,7 +470,135 @@ struct play_process {
 	int fd;
 };
 
-static void __play_pids(gzFile zfd, struct play_process *p, unsigned size)
+struct play_queue {
+	int pfd[2];
+};
+
+static int play_queue_in(struct play_queue *queue)
+{ return queue->pfd[0]; }
+
+static int play_queue_out(struct play_queue *queue)
+{ return queue->pfd[1]; }
+
+static int play_queue_setup(struct play_queue *queue)
+{
+	if (pipe(queue->pfd))
+		return errno;
+	return 0;
+}
+
+
+struct play_worker {
+	struct list_head link;
+	struct play_queue queue;
+	unsigned long long time;
+	pid_t pid;
+};
+
+static int play_worker_setup(const struct blkplay_config *conf,
+			struct play_worker *worker)
+{
+	int ret = play_queue_setup(&worker->queue);
+
+	if (ret)
+		return ret;
+
+	worker->time = 0;
+	worker->pid = fork();
+
+	if (worker->pid < 0) {
+		close(play_queue_in(&worker->queue));
+		close(play_queue_out(&worker->queue));
+		return errno;
+	}
+
+	if (worker->pid == 0) {
+		close(play_queue_out(&worker->queue));
+		play(conf, play_queue_in(&worker->queue));
+		close(play_queue_in(&worker->queue));
+		exit(0);
+	} else {
+		close(play_queue_in(&worker->queue));
+	}
+
+	return 0;
+}
+
+static void play_worker_release(struct play_worker *worker)
+{
+	close(play_queue_out(&worker->queue));
+
+	int status;
+
+	do {
+		waitpid(worker->pid, &status, 0);
+	} while (!WIFEXITED(status) || errno != ECHILD);
+}
+
+struct play_pool {
+	struct list_head head;
+	struct play_worker *worker;
+	size_t size;
+};
+
+static void play_pool_release(struct play_pool *pool)
+{
+	struct list_head *head = &pool->head;
+
+	for (struct list_head *ptr = head->next; ptr != head; ptr = ptr->next) {
+		struct play_worker *worker = list_entry(ptr, struct play_worker,
+					link);
+
+		play_worker_release(worker);
+	}
+	free(pool->worker);
+}
+
+static int play_pool_setup(const struct blkplay_config *conf,
+			struct play_pool *pool)
+{
+	pool->worker = calloc(conf->pool_size + 1, sizeof(*pool->worker));
+
+	if (!pool->worker)
+		return ENOMEM;
+
+	list_head_init(&pool->head);
+	for (int i = 0; i != conf->pool_size; ++i) {
+		int ret = play_worker_setup(conf, pool->worker + i);
+
+		if (ret) {
+			ERR("Cannot setup play process\n");
+			play_pool_release(pool);
+			return ret;
+		}
+		list_link_after(&pool->head, &pool->worker[i].link);
+	}
+	pool->size = conf->pool_size;
+
+	return 0;
+}
+
+static int play_pool_submit(struct play_pool *pool,
+			const struct blkio_stats *stats)
+{
+	struct play_worker *worker = pool->worker;
+
+	for (size_t i = 0; i != pool->size; ++i) {
+		if (pool->worker[i].time < worker->time)
+			worker = &pool->worker[i];
+	}
+
+	worker->time = stats->end_time;
+
+	if (blkio_stats_write(play_queue_out(&worker->queue), stats)) {
+		ERR("Submit failed\n");
+		return 1;
+	}
+	return 0;
+}
+
+static void __play_pids(const struct blkplay_config *conf,
+			gzFile zfd, struct play_pool *pool)
 {
 	const unsigned long long play_time = current_time();
 
@@ -480,15 +607,14 @@ static void __play_pids(gzFile zfd, struct play_process *p, unsigned size)
 
 	while (!blkio_zstats_read(zfd, &stats)) {
 		const unsigned long pid = stats.pid;
-		unsigned parent;
 
-		if (!to_play(pid))
+		if (!to_play(conf, pid))
 			continue;
 
 		if (record_time > stats.begin_time)
 			record_time = stats.begin_time;
 
-		if (time_accurate) {
+		if (conf->time_accurate) {
 			const unsigned long long p_elapsed =
 						current_time() - play_time;
 			const unsigned long long r_elapsed =
@@ -498,167 +624,99 @@ static void __play_pids(gzFile zfd, struct play_process *p, unsigned size)
 				delay(r_elapsed - p_elapsed);
 		}
 
-		parent = 0;
-		
-		if (blkio_stats_write(p[parent].fd, &stats))
-			break;
-
-		p[parent].end_time = stats.end_time;
-		while (parent < size) {
-			const size_t l = 2 * (parent + 1) - 1;
-			const size_t r = 2 * (parent + 1);
-			size_t swap = parent;
-
-			if (l < size && p[l].end_time < p[swap].end_time)
-				swap = l;
-
-			if (r < size && p[r].end_time < p[swap].end_time)
-				swap = r;
-
-			if (swap == parent)
-				break;
-
-			struct play_process tmp = p[parent];
-
-			p[parent] = p[swap];
-			p[swap] = tmp;
-			parent = swap;
-		}
+		play_pool_submit(pool, &stats);
 	}	
 }
 
-static void play_pids(gzFile zfd, int pool_size)
+static void play_pids(const struct blkplay_config *conf, gzFile zfd)
 {
-	struct play_process player[MAX_PLAY_PROCESSES];
-	int fail = 0;
+	struct play_pool pool;
 
-	for (int i = 0; i != pool_size; ++i) {
-		player[i].end_time = 0;
-		player[i].fd = -1;
-		player[i].pid = -1;
+	if (play_pool_setup(conf, &pool)) {
+		ERR("Cannot create pool of play processes\n");
+		return;
 	}
 
-	for (int i = 0; i != pool_size; ++i) {
-		int pfds[2];
-
-		if (pipe(pfds)) {
-			perror("Cannot create pipe for play process");
-			fail = 1;
-			for (int j = 0; j != i; ++j)
-				close(player[j].fd);
-			break;
-		}
-
-		player[i].fd = pfds[1];
-		player[i].pid = fork();
-		if (player[i].pid < 0) {
-			perror("Cannot create play process");
-			fail = 1;
-			close(pfds[0]);
-			close(pfds[1]);
-			for (int j = 0; j != i; ++j)
-				close(player[j].fd);
-			break;
-		}
-
-		if (!player[i].pid) {
-			for (int j = 0; j != i; ++j)
-				close(player[j].fd);
-			close(pfds[1]);
-			play(pfds[0]);
-			close(pfds[0]);
-			return;
-		}
-	}
-
-	if (!fail) {
-		ERR("Start playing\n");
-		__play_pids(zfd, player, pool_size);
-		ERR("Finished\n");
-		for (int i = 0; i != pool_size; ++i)
-			close(player[i].fd);
-	}
-
-	for (int i = 0; i != pool_size; ++i) {
-		if (player[i].pid < 0)
-			break;
-		waitpid(player[i].pid, NULL, 0);
-	}
+	ERR("Start playing\n");
+	__play_pids(conf, zfd, &pool);
+	ERR("Release resources\n");
+	play_pool_release(&pool);
+	ERR("Finished\n");
 }
 
-static int count_pool_size(gzFile zfd)
+static int count_pool_size(const struct blkplay_config *conf, gzFile zfd)
 {
-	unsigned long long et[MAX_PLAY_PROCESSES];
+	static const int default_play_processes = 4;
+
+	unsigned long long *end_time = calloc(default_play_processes,
+				sizeof(*end_time));
+
+	if (!end_time) {
+		ERR("Cannot count number of processes\n");
+		return default_play_processes;
+	}
+
 	struct blkio_stats stats;
-	int ps = 0;
+	int size = 0, capacity = default_play_processes;
 
 	while (!blkio_zstats_read(zfd, &stats)) {
 		const unsigned long pid = stats.pid;
 
-		if (!to_play(pid))
+		if (!to_play(conf, pid))
 			continue;
 
-		if (!ps || et[0] > stats.begin_time) {
-			size_t child = ps++;
+		unsigned long long time = ~0ull;
+		int min_idx = 0;
 
-			assert(child != MAX_PLAY_PROCESSES &&
-					"Too many play processes required");
-
-			et[child] = stats.end_time;
-			while (child != 0) {
-				const size_t parent = (child + 1) / 2 - 1;
-				unsigned long long tmp;
-
-				if (et[child] >= et[parent])
-					break;
-
-				tmp = et[parent];
-				et[parent] = et[child];
-				et[child] = tmp;
-				child = parent;
-			}
-		} else {
-			int parent = 0;
-
-			et[parent] = stats.end_time;
-			while (parent < ps) {
-				unsigned long long tmp;
-				const int l = 2 * (parent + 1) - 1;
-				const int r = 2 * (parent + 1);
-				int swap = parent;
-
-				if (l < ps && et[l] < et[swap])
-					swap = l;
-
-				if (r < ps && et[r] < et[swap])
-					swap = r;
-
-				if (swap == parent)
-					break;
-
-				tmp = et[parent];
-				et[parent] = et[swap];
-				et[swap] = tmp;
-				parent = swap;
+		for (int i = 0; i != size; ++i) {
+			if (end_time[min_idx] < time) {
+				time = end_time[min_idx];
+				min_idx = i;
 			}
 		}
-	}
 
-	return ps;
+		if (time < stats.begin_time) {
+			end_time[min_idx] = stats.end_time;
+			continue;
+		}
+
+		if (size == capacity) {
+			unsigned long long *et = realloc(end_time,
+					2 * capacity * sizeof(*end_time));
+
+			if (!et) {
+				ERR("Cannot count number of processes\n");
+				free(end_time);
+				return size;
+			}
+			capacity *= 2;
+			end_time = et;
+		}
+		end_time[size++] = stats.end_time;
+	}
+	free(end_time);
+	return size;
 }
 
-static void find_and_play_pids(void)
+static void blkplay_host(struct blkplay_config *config)
 {
-	gzFile zfd = gzopen(input_file_name, "rb");
+	gzFile zfd = gzopen(config->input_file_name, "rb");
 	if (!zfd) {
 		ERR("Cannot allocate enough memory for zlib\n");
 		return;
 	}
 
-	const int ps = count_pool_size(zfd);
+	config->pool_size = count_pool_size(config, zfd);
+
+	ERR("device: %s\n", config->block_device_name);
+	ERR("engine: %s\n", config->io_engine_name);
+	ERR("processes: %d\n", config->pool_size);
+	ERR("events: %d\n", config->number_of_events);
+	ERR("time accurate: %d\n", config->time_accurate);
+	ERR("keep io delay: %d\n", config->keep_io_delay);
 
 	gzrewind(zfd);
-	play_pids(zfd, ps);
+	play_pids(config, zfd);
 	gzclose(zfd);
 }
 
@@ -681,77 +739,120 @@ static void reclaim_child(int sig)
 	}
 }
 
-#define PLAY_CMD_MAX_LENGTH    4096
+#define PLAY_CMD_MSG_TYPE      1
 
-struct play_cmd_header {
+struct blkplay_msg_header {
+	__u32 type;
 	__u32 size;
+} __attribute__((packed));
+
+struct blkplay_play_cmd {
+	struct blkplay_msg_header header;
 	__u32 events;
 	__u32 pool;
 	__u32 engine;
 	__u32 device;
 	__u32 accurate;
 	__u32 delay;
-};
+} __attribute__((packed));
+
+static int blkplay_send_play_cmd(int fd, const struct blkplay_config *conf)
+{
+	static const int sz = sizeof(struct blkplay_play_cmd);
+	static char buffer[4096];
+
+	const int dev_len = strlen(conf->block_device_name) + 1;
+	const int engine_len = strlen(conf->io_engine_name) + 1;
+	const int size = sz + dev_len + engine_len;
+
+	if (size > 4096)
+		return 0;
+
+	struct blkplay_play_cmd cmd;
+
+	memset(&cmd, 0, sizeof(cmd));
+
+	cmd.header.type = htole32(PLAY_CMD_MSG_TYPE);
+	cmd.header.size = htole32(size);
+	cmd.pool = htole32(conf->pool_size);
+	cmd.events = htole32(conf->number_of_events);
+	cmd.accurate = conf->time_accurate;
+	cmd.delay = conf->keep_io_delay;
+	cmd.device = htole32(sz);
+	cmd.engine = htole32(sz + dev_len);
+
+	memcpy(buffer, &cmd, size);
+	memcpy(buffer + sz, conf->block_device_name, dev_len);
+	memcpy(buffer + sz + dev_len, conf->io_engine_name, engine_len);
+
+	return mywrite(fd, buffer, size);
+}
+
+static int blkplay_read_play_cmd(int fd, struct blkplay_config *config)
+{
+	static const int sz = sizeof(struct blkplay_play_cmd);
+	static char buffer[4096];
+
+	struct blkplay_play_cmd cmd;
+
+	if (myread(fd, (void *)&cmd, sz)) {
+		ERR("Cannot read header\n");
+		return 1;
+	}
+
+	if (myread(fd, buffer + sz, le32toh(cmd.header.size) - sz)) {
+		ERR("Cannot read data\n");
+		return 1;
+	}
+
+	memset(config, 0, sizeof(*config));
+
+	config->block_device_name = buffer + le32toh(cmd.device);
+	config->io_engine_name = buffer + le32toh(cmd.engine);
+	config->number_of_events = le32toh(cmd.events);
+	config->pool_size = le32toh(cmd.pool);
+	config->time_accurate = cmd.accurate;
+	config->keep_io_delay = cmd.delay;
+
+	if (!config->pool_size) {
+		ERR("Recevied pool size is zero, use number of cpus instead\n");
+		config->pool_size = sysconf(_SC_NPROCESSORS_CONF);
+		if (config->pool_size < 0) {
+			ERR("Cannot get number of CPUs\n");
+			return 1;
+		}
+	}
+
+	config->io_engine = io_engine_find(config->io_engine_name);
+	if (!config->io_engine) {
+		ERR("Cannot find io engine %s\n", config->io_engine_name);
+		return 1;
+	}
+
+	return 0;
+}
 
 static void handle_connection(int fd)
 {
-	const int sz = sizeof(struct play_cmd_header);
-	char buffer[PLAY_CMD_MAX_LENGTH];
+	struct blkplay_config config;
 
-	ERR("Handle input connection\n");
-	if (myread(fd, buffer, sz)) {
-		ERR("Cannot read command header\n");
+	ERR("Input connection\n");
+	if (blkplay_read_play_cmd(fd, &config)) {
+		ERR("Cannot read play configuration\n");
 		close(fd);
 		return;
 	}
 
-	struct play_cmd_header header;
-
-	memcpy((char *)&header, buffer, sz);
-
-	header.size = le32toh(header.size);
-	header.events = le32toh(header.events);
-	header.pool = le32toh(header.pool);
-	header.engine = le32toh(header.engine);
-	header.device = le32toh(header.device);
-	header.accurate = le32toh(header.device);
-	header.delay = le32toh(header.delay);
-
-	if (myread(fd, buffer + sz, header.size - sz)) {
-		ERR("Cannot read command header\n");
-		close(fd);
-		return;
-	}
-
-	block_device_name = buffer + header.device;
-	io_engine_name = buffer + header.engine;
-	number_of_events = header.events;
-	time_accurate = (header.accurate != 0);
-	keep_io_delay = (header.delay != 0);
-
-	io_engine = io_engine_find(io_engine_name);
-	if (!io_engine) {
-		ERR("Engine %s is'n supported\n", io_engine_name);
-		close(fd);
-		return;
-	}
-
-	if (header.pool >= MAX_PLAY_PROCESSES) {
-		ERR("Requested pool is too large\n");
-		close(fd);
-		return;
-	}
-
-	ERR("device: %s\n", block_device_name);
-	ERR("engine: %s\n", io_engine_name);
-	ERR("events: %d\n", number_of_events);
-	ERR("pool: %d\n", header.pool);
-	ERR("accurate: %d\n", time_accurate);
-	ERR("io delay: %d\n", keep_io_delay);
+	ERR("device: %s\n", config.block_device_name);
+	ERR("engine: %s\n", config.io_engine_name);
+	ERR("processes: %d\n", config.pool_size);
+	ERR("events: %d\n", config.number_of_events);
+	ERR("time accurate: %d\n", config.time_accurate);
+	ERR("keep io delay: %d\n", config.keep_io_delay);
 
 	gzFile izfd = gzdopen(fd, "rb");
 	if (izfd) {
-		play_pids(izfd, header.pool);
+		play_pids(&config, izfd);
 		gzclose(izfd);
 	} else {
 		ERR("Cannot allocate zlib buffer\n");
@@ -761,6 +862,12 @@ static void handle_connection(int fd)
 
 static void blkplay_server(void)
 {
+	handle_signal(SIGINT, finish_blkplay);
+	handle_signal(SIGHUP, finish_blkplay);
+	handle_signal(SIGTERM, finish_blkplay);
+	handle_signal(SIGALRM, finish_blkplay);
+	handle_signal(SIGCHLD, reclaim_child);
+
 	int fd = server_socket(service, SOCK_STREAM);
 
 	if (fd == -1) {
@@ -798,51 +905,15 @@ static void blkplay_server(void)
 	ERR("blkplayd finished\n");
 }
 
-static void run_server(void)
-{
-	pid_t pid = fork();
-
-	if (pid < 0) {
-		ERR("Cannot create daemon process\n");
-		return;
-	}
-
-	if (pid > 0)
-		return;
-
-	pid_t sid = setsid();
-
-	if (sid < 0) {
-		ERR("Cannot create a new session\n");
-		return;
-	}
-
-	fclose(stdin);
-	fclose(stdout);
-
-	handle_signal(SIGINT, finish_blkplay);
-	handle_signal(SIGHUP, finish_blkplay);
-	handle_signal(SIGTERM, finish_blkplay);
-	handle_signal(SIGALRM, finish_blkplay);
-	handle_signal(SIGCHLD, reclaim_child);
-
-	openlog("blkplayd", 0, 0);
-	redirect_to_syslog(&stderr);
-	if (chdir("/"))
-		ERR("Cannot change dir to \"/\" (%d)", errno);
-	else
-		blkplay_server();
-	closelog();
-}
-
-static void send_stats(gzFile izfd, gzFile ozfd)
+static void send_stats(const struct blkplay_config *config, gzFile izfd,
+			gzFile ozfd)
 {
 	struct blkio_stats stats;
 
 	while (!blkio_zstats_read(izfd, &stats)) {
 		const unsigned long pid = stats.pid;
 
-		if (!to_play(pid))
+		if (!to_play(config, pid))
 			continue;
 
 		if (blkio_zstats_write(ozfd, &stats))
@@ -850,37 +921,17 @@ static void send_stats(gzFile izfd, gzFile ozfd)
 	}
 }
 
-static void run_client(void)
+static void blkplay_client(struct blkplay_config *config)
 {
-	const int sz = sizeof(struct play_cmd_header);
-	char buffer[PLAY_CMD_MAX_LENGTH];
-	struct play_cmd_header header;
-
-	int dev_len = strlen(block_device_name);
-	int engine_len = strlen(io_engine_name);
-	int size = sz + dev_len + engine_len + 2;
-
-	memset(buffer, 0, PLAY_CMD_MAX_LENGTH);
-	header.size = htole32(size);
-	header.events = htole32(number_of_events);
-	header.accurate = time_accurate;
-	header.delay = keep_io_delay;
-	header.device = htole32(sz);
-	header.engine = htole32(sz + dev_len + 1);
-
-	gzFile zfd = gzopen(input_file_name, "rb");
+	gzFile zfd = gzopen(config->input_file_name, "rb");
 
 	if (!zfd) {
 		ERR("Cannot allocate zlib buffer\n");
 		return;
 	}
 
-	header.pool = htole32(count_pool_size(zfd));
+	config->pool_size = count_pool_size(config, zfd);
 	gzrewind(zfd);
-
-	memcpy(buffer, &header, sz);
-	memcpy(buffer + sz, block_device_name, dev_len + 1);
-	memcpy(buffer + sz + dev_len + 1, io_engine_name, engine_len + 1);
 
 	int fd = client_socket(node, service, SOCK_STREAM);
 
@@ -890,8 +941,8 @@ static void run_client(void)
 		return;
 	}
 
-	if (mywrite(fd, buffer, size)) {
-		ERR("Failed to send play commad\n");
+	if (blkplay_send_play_cmd(fd, config)) {
+		ERR("Failed to send play configuration\n");
 		gzclose(zfd);
 		close(fd);
 		return;
@@ -899,7 +950,7 @@ static void run_client(void)
 
 	gzFile ozfd = gzdopen(fd, "wb");
 	if (ozfd) {
-		send_stats(zfd, ozfd);
+		send_stats(config, zfd, ozfd);
 		gzclose(ozfd);
 	} else {
 		ERR("Cannot allocate zlib buffer\n");
@@ -910,20 +961,25 @@ static void run_client(void)
 
 int main(int argc, char **argv)
 {
-	if (parse_args(argc, argv))
+	struct blkplay_config config;
+
+	if (parse_args(&config, argc, argv)) {
+		show_usage(argv[0]);
 		return 1;
+	}
 
 	srand(time(NULL));
 
 	switch (play_mode) {
 	case BM_SERVER:
-		run_server();
+		if (deamon("blkplayd", &blkplay_server))
+			ERR("Cannot run deamon process (%d)\n", errno);
 		break;
 	case BM_CLIENT:
-		run_client();
+		blkplay_client(&config);
 		break;
 	case BM_HOST:
-		find_and_play_pids();
+		blkplay_host(&config);
 		break;
 	}
 

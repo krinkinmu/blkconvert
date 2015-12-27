@@ -6,7 +6,7 @@ BLKPLAY_LDFLAGS   := $(LDFLAGS) -laio -lz
 BLKRECORD_LDFLAGS := $(LDFLAGS) -lz
 
 COMMON_SRC := algorithm.c object_cache.c file_io.c ctree.c list.c rbtree.c \
-	debug.c utils.c network.c cbuffer.c
+	debug.c utils.c network.c cbuffer.c deamon.c
 COMMON_DEP := $(COMMON_SRC:.c=.d)
 COMMON_OBJ := $(COMMON_SRC:.c=.o)
 
