@@ -19,15 +19,16 @@
 #include "usio_engine.h"
 #include "aio_engine.h"
 #include "algorithm.h"
-#include "blkrecord.h"
 #include "io_engine.h"
 #include "generator.h"
+#include "account.h"
 #include "file_io.h"
 #include "network.h"
 #include "deamon.h"
 #include "common.h"
 #include "debug.h"
 #include "utils.h"
+#include "list.h"
 
 
 struct blkplay_config {

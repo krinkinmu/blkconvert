@@ -1,7 +1,7 @@
 #ifndef __GENERATOR_H__
 #define __GENERATOR_H__
 
-#include "blkrecord.h"
+#include "account.h"
 
 static const unsigned long long sector_size = 512;
 
