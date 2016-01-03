@@ -640,17 +640,10 @@ static void blkio_record_context_release(struct blkio_record_context *ctx)
 	gzclose(ctx->zofd);
 }
 
-struct blktrace_ctx {
-	struct blk_user_trace_setup conf;
-	struct pollfd *pfds;
-	struct cbuffer *bufs;
-	int cpus;
-	int fd;
-};
 
-static int blktrace_start(struct blktrace_ctx *ctx)
+static int blktrace_start(struct blkio_trace_context *ctx)
 {
-	if (ioctl(ctx->fd, BLKTRACESTART) < 0) {
+	if (ioctl(ctx->tfd, BLKTRACESTART) < 0) {
 		ERR("BLKTRACESTART failed with error (%d)\n", errno);
 		return 1;
 	}
@@ -658,20 +651,32 @@ static int blktrace_start(struct blktrace_ctx *ctx)
 	return 0;
 }
 
-static void blktrace_stop(struct blktrace_ctx *ctx)
-{ ioctl(ctx->fd, BLKTRACESTOP); }
-
-static void blktrace_ctx_release(struct blktrace_ctx *ctx)
+static void blktrace_stop(struct blkio_trace_context *ctx)
 {
-	if (ctx->fd <= 0)
+	const int rc = ioctl(ctx->tfd, BLKTRACESTOP);
+
+	if (rc)
+		ERR("BLKTRACESTOP failed with %d (%d)\n", rc, errno);
+}
+
+static void blktrace_exit(struct blkio_trace_context *ctx)
+{
+	const int rc = ioctl(ctx->tfd, BLKTRACETEARDOWN);
+
+	if (rc)
+		ERR("BLKTRACETEARDOWN failed with %d (%d)\n", rc, errno);
+}
+
+static void blktrace_release(struct blkio_trace_context *ctx)
+{
+	if (ctx->tfd < 0)
 		return;
 
 	blktrace_stop(ctx);
-	ioctl(ctx->fd, BLKTRACETEARDOWN);
 
 	if (ctx->pfds) {
 		for (int i = 0; i != ctx->cpus; ++i) {
-			if (ctx->pfds[i].fd <= 0)
+			if (ctx->pfds[i].fd < 0)
 				break;
 			close(ctx->pfds[i].fd);
 		}
@@ -684,10 +689,37 @@ static void blktrace_ctx_release(struct blktrace_ctx *ctx)
 		free(ctx->bufs);
 	}
 
-	close(ctx->fd);
+	blktrace_exit(ctx);
+	close(ctx->tfd);
 }
 
-static int blktrace_ctx_setup(struct blktrace_ctx *ctx, int fd)
+static int blktrace_get_drops(struct blkio_trace_context *ctx)
+{
+	char filename[MAXPATHLEN + 64];
+
+	snprintf(filename, sizeof(filename), "%s/block/%s/dropped",
+		debugfs_root_path, ctx->conf.name);
+
+	int fd = open(filename, O_RDONLY);
+
+	if (fd < 0) {
+		ERR("Cannot open %s (%d)\n", filename, errno);
+		return 0;
+	}
+
+	char drops[256] = {0};
+	int count = 0;
+
+	if (read(fd, drops, sizeof(drops)) < 0)
+		ERR("Read from %s failed (%d)\n", filename, errno);
+	else
+		count = atoi(drops);
+	
+	close(fd);
+	return count;
+}
+
+static int blktrace_setup(struct blkio_trace_context *ctx, int cfd)
 {
 	char filename[MAXPATHLEN + 64];
 
@@ -695,6 +727,7 @@ static int blktrace_ctx_setup(struct blktrace_ctx *ctx, int fd)
 	ctx->conf.act_mask = action_mask;
 	ctx->conf.buf_size = buffer_size;
 	ctx->conf.buf_nr = buffer_count;
+	ctx->cfd = cfd;
 
 	ctx->cpus = sysconf(_SC_NPROCESSORS_CONF);
 	if (ctx->cpus < 0) {
@@ -702,37 +735,37 @@ static int blktrace_ctx_setup(struct blktrace_ctx *ctx, int fd)
 		return 1;
 	}
 
-	ctx->fd = open(block_device_name, O_RDONLY | O_NONBLOCK);
-	if (ctx->fd < 0) {
+	ctx->tfd = open(block_device_name, O_RDONLY | O_NONBLOCK);
+	if (ctx->tfd < 0) {
 		ERR("Cannot open device %s (%d)\n", block_device_name, errno);
-		return 1;
-	}
-
-	ctx->pfds = calloc(ctx->cpus + 1, sizeof(*ctx->pfds));
-	if (!ctx->pfds) {
-		ERR("Cannot allocate poll descriptors\n");
-		blktrace_ctx_release(ctx);
 		return 1;
 	}
 
 	ctx->bufs = calloc(ctx->cpus, sizeof(*ctx->bufs));
 	if (!ctx->bufs) {
 		ERR("Cannot allocate read buffers\n");
-		blktrace_ctx_release(ctx);
+		blktrace_release(ctx);
 		return 1;
 	}
 
 	for (int i = 0; i != ctx->cpus; ++i) {
 		if (cbuffer_setup(ctx->bufs + i, buffer_size)) {
 			ERR("Cannot allocate read buffers\n");
-			blktrace_ctx_release(ctx);
+			blktrace_release(ctx);
 			return 1;
 		}
 	}
 
-	if (ioctl(ctx->fd, BLKTRACESETUP, &ctx->conf) < 0) {
-		ERR("Cannot setup blktrace\n");
-		blktrace_ctx_release(ctx);
+	if (ioctl(ctx->tfd, BLKTRACESETUP, &ctx->conf) < 0) {
+		ERR("Cannot setup blktrace (%d)\n", errno);
+		blktrace_release(ctx);
+		return 1;
+	}
+
+	ctx->pfds = calloc(ctx->cpus + 1, sizeof(*ctx->pfds));
+	if (!ctx->pfds) {
+		ERR("Cannot allocate poll descriptors\n");
+		blktrace_release(ctx);
 		return 1;
 	}
 
@@ -742,23 +775,39 @@ static int blktrace_ctx_setup(struct blktrace_ctx *ctx, int fd)
 
 		ctx->pfds[i].fd = open(filename, O_RDONLY | O_NONBLOCK);
 		if (ctx->pfds[i].fd < 0) {
-			blktrace_ctx_release(ctx);
+			blktrace_release(ctx);
 			return 1;
 		}
 		ctx->pfds[i].events = POLLIN;
 	}
 
-	ctx->pfds[ctx->cpus].fd = fd;
+	ctx->pfds[ctx->cpus].fd = cfd;
 	ctx->pfds[ctx->cpus].events = POLLIN;
 
 	return 0;
 }
 
-static int dump_device_traces(struct cbuffer *buffer,
+static int blktrace_poll(struct blkio_trace_context *ctx, int timeout)
+{
+	int rc;
+
+	do {
+		for (int i = 0; i != ctx->cpus + 1; ++i) {
+			if (ctx->pfds[i].revents & POLLIN) {
+				ctx->pfds[i].revents = 0;
+				return i;
+			}
+		}
+
+		rc = poll(ctx->pfds, ctx->cpus + 1, timeout);
+	} while (rc > 0);
+
+	return rc;
+}
+
+static void dump_traces(struct cbuffer *buffer,
 			struct blkio_record_context *rctx)
 {
-	int ret = 0;
-
 	while (1) {
 		struct blk_io_trace trace;
 		const size_t sz = sizeof(trace);
@@ -768,7 +817,6 @@ static int dump_device_traces(struct cbuffer *buffer,
 
 		if (blk_io_trace_to_cpu(&trace)) {
 			done = 1;
-			ret = 1;
 			break;
 		}
 
@@ -778,66 +826,57 @@ static int dump_device_traces(struct cbuffer *buffer,
 		cbuffer_advance(buffer, sz + trace.pdu_len);
 		blktrace_submit(rctx, &trace);
 	}
-
-	return ret;
 }
 
-static void read_device_traces(struct blktrace_ctx *tctx,
-			struct blkio_record_context *rctx, bool force)
+static void read_device_traces(struct blkio_trace_context *tctx,
+			struct blkio_record_context *rctx,
+			int device)
 {
-	struct pollfd *pfd = tctx->pfds;
-	struct cbuffer *buf = tctx->bufs;
+	ssize_t ret = cbuffer_fill(tctx->bufs + device, tctx->pfds[device].fd);
 
-	for (int i = 0; i != tctx->cpus; ++i) {
-		if (!force && (pfd[i].revents & POLLIN) == 0)
-			continue;
+	while (ret > 0) {
+		if (cbuffer_full(tctx->bufs + device))
+			dump_traces(tctx->bufs + device, rctx);
 
-		ssize_t ret = cbuffer_fill(buf + i, pfd[i].fd);
-
-		while (ret > 0) {
-			if (cbuffer_full(buf + i))
-				if (dump_device_traces(buf + i, rctx))
-					return;
-
-			ret = cbuffer_fill(buf + i, pfd[i].fd);
-		}
-
-		if (ret != 0 && errno != EAGAIN) {
-			pfd[i].events = 0;
-			pfd[i].revents = 0;
-		}
-
-		if (dump_device_traces(buf + i, rctx))
-			return;
+		ret = cbuffer_fill(tctx->bufs + device, tctx->pfds[device].fd);
 	}
+
+	if (ret != 0 && errno != EAGAIN)
+		tctx->pfds[device].events = 0;
+
+	dump_traces(tctx->bufs + device, rctx);
 }
 
-static void traces_from_device(struct blkio_record_context *rctx, int fd)
+static void trace_device(struct blkio_record_context *rctx, int fd)
 {
 	const int timeout = 500;
-	struct blktrace_ctx tctx;
+	struct blkio_trace_context tctx;
 
-	if (blktrace_ctx_setup(&tctx, fd))
+	if (blktrace_setup(&tctx, fd))
 		return;
 	
 	if (!blktrace_start(&tctx)) {
 		while (!done) {
-			int ret = poll(tctx.pfds, tctx.cpus + 1, timeout);
+			int ret = blktrace_poll(&tctx, timeout);
 
 			if (ret <= 0)
 				continue;
 
-			if ((tctx.pfds[tctx.cpus].revents & POLLIN) != 0) {
+			if (ret == tctx.cpus) {
 				ERR("Finishing\n");
 				break;
 			}
 
-			read_device_traces(&tctx, rctx, false);
+			read_device_traces(&tctx, rctx, ret);
 		}
 		blktrace_stop(&tctx);
-		read_device_traces(&tctx, rctx, true);
+
+		for (int i = 0; i != tctx.cpus; ++i)
+			read_device_traces(&tctx, rctx, i);
+
+		ERR("%d drops encountered\n", blktrace_get_drops(&tctx));
 	}
-	blktrace_ctx_release(&tctx);
+	blktrace_release(&tctx);
 }
 
 #define RECORD_CMD_MAX_LENGTH 4096
@@ -889,7 +928,7 @@ static void handle_connection(int fd)
 		blkio_record_context_init(&ctx);
 		ctx.zofd = zofd;
 
-		traces_from_device(&ctx, fd);
+		trace_device(&ctx, fd);
 
 		blkio_record_context_dump(&ctx, ~0ull);
 		blkio_record_context_finit(&ctx);
@@ -1047,10 +1086,9 @@ int main(int argc, char **argv)
 			if (input_file_name)
 				traces_from_file(&ctx);
 			else
-				traces_from_device(&ctx, -1);
+				trace_device(&ctx, -1);
 			blkio_record_context_release(&ctx);
 		}
-
 		break;
 	}
 	case BM_CLIENT:

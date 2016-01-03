@@ -39,4 +39,13 @@ static inline void blkio_record_context_finit(struct blkio_record_context *ctx)
 	blkio_queue_finit(&ctx->write);
 }
 
+struct blkio_trace_context {
+	struct blk_user_trace_setup conf;
+	struct pollfd *pfds;
+	struct cbuffer *bufs;
+	int cpus;
+	int tfd;
+	int cfd;
+};
+
 #endif /*__BLKRECORD_H__*/
