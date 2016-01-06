@@ -707,10 +707,12 @@ static int blktrace_get_drops(struct blkio_trace_context *ctx)
 		return 0;
 	}
 
-	char drops[256] = {0};
+	char drops[256];
 	int count = 0;
 
-	if (read(fd, drops, sizeof(drops)) < 0)
+	memset(drops, 0, sizeof(memset));
+
+	if (read(fd, drops, sizeof(drops) - 1) < 0)
 		ERR("Read from %s failed (%d)\n", filename, errno);
 	else
 		count = atoi(drops);
