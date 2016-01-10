@@ -153,26 +153,6 @@ static void blkio_processor_populate(struct blkio_processor *proc)
 	}
 }
 
-/*
-static void __blkio_processor_release_buffers(struct rb_node *node)
-{
-	while (node) {
-		struct blkio_buffer *buf = rb_entry(node, struct blkio_buffer,
-					node);
-
-		__blkio_processor_release_buffers(node->rb_right);
-		node = node->rb_left;
-		blkio_free_buffer(buf);
-	}
-}
-
-static void blkio_processor_release_buffers(struct blkio_processor *proc)
-{
-	__blkio_processor_release_buffers(proc->buffers.rb_node);
-	proc->buffers.rb_node = 0;
-}
-*/
-
 static struct blkio_buffer *blkio_processor_peek(struct blkio_processor *proc)
 {
 	struct rb_node *first = rb_first(&proc->buffers);
@@ -606,27 +586,6 @@ static int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
 
 	return 0;
 }
-
-/*
-static long blkio_release_traces(struct blkio_tracer *tracer)
-{
-	struct list_head *head = &tracer->bufs;
-	struct list_head *ptr = head->next;
-
-	long bytes = 0;
-
-	while (head != ptr) {
-		struct blkio_buffer *buf = list_entry(ptr, struct blkio_buffer,
-			head);
-
-		ptr = ptr->next;
-		bytes += buf->size;
-		blkio_free_buffer(buf);
-	}
-
-	return bytes;
-}
-*/
 
 static int blkio_get_drops(struct blkio_record_ctx *ctx)
 {
