@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
 #include <poll.h>
 
 #include <stddef.h>
@@ -17,8 +18,9 @@
 
 
 #define BLKIO_BUFFER_SIZE (512 * 1024)
+#define DEBUGFS           "/sys/kernel/debug"
 
-static struct blkio_buffer *blkio_buffer_alloc(int size)
+static struct blkio_buffer *blkio_alloc_buffer(int size)
 {
 	void *ptr = malloc(sizeof(struct blkio_buffer) + size);
 
@@ -27,18 +29,18 @@ static struct blkio_buffer *blkio_buffer_alloc(int size)
 
 	struct blkio_buffer *buffer = ptr;
 
-	list_head_init(&buffer->link);
+	memset(buffer, 0, sizeof(*buffer));
+	list_head_init(&buffer->head);
 	buffer->data = (void *)(buffer + 1);
-	buffer->pos = 0;
 	buffer->size = size;
 
 	return buffer;
 }
 
-static void blkio_buffer_free(struct blkio_buffer *buf)
+static void blkio_free_buffer(struct blkio_buffer *buf)
 { free(buf); }
 
-static struct blkio_tracer *blkio_tracer_alloc(struct blkio_record_ctx *ctx)
+static struct blkio_tracer *blkio_alloc_tracer(void)
 {
 	struct blkio_tracer *tracer = malloc(sizeof(struct blkio_tracer));
 
@@ -48,24 +50,169 @@ static struct blkio_tracer *blkio_tracer_alloc(struct blkio_record_ctx *ctx)
 	list_head_init(&tracer->link);
 	list_head_init(&tracer->bufs);
 	assert(!pthread_mutex_init(&tracer->lock, NULL));
+	assert(!pthread_cond_init(&tracer->cond, NULL));
 	CPU_ZERO(&tracer->cpuset);
-	tracer->ctx = ctx;
+	tracer->state = TRACE_WAIT;
 	tracer->fd = -1;
 	return tracer;
 }
 
-static void blkio_tracer_free(struct blkio_tracer *tracer)
+static void blkio_free_tracer(struct blkio_tracer *tracer)
 {
 	assert(!pthread_mutex_destroy(&tracer->lock));
+	assert(!pthread_cond_destroy(&tracer->cond));
 	free(tracer);
 }
 
-static void blkio_trace_wait(struct blkio_record_ctx *ctx);
+static unsigned long long blkio_timestamp(void)
+{
+	static const unsigned long long NS = 1000000000ull;
+	struct timespec sp;
+
+	clock_gettime(CLOCK_MONOTONIC_RAW, &sp);
+	return sp.tv_sec * NS + sp.tv_nsec;
+}
+
+static void blkio_tracer_wait(struct blkio_tracer *tracer)
+{
+	pthread_mutex_lock(&tracer->lock);
+	while (tracer->state == TRACE_WAIT)
+		pthread_cond_wait(&tracer->cond, &tracer->lock);
+	pthread_mutex_unlock(&tracer->lock);
+}
+
+static void blkio_processor_wait(struct blkio_processor *proc)
+{
+	pthread_mutex_lock(&proc->lock);
+	while (proc->state == TRACE_WAIT)
+		pthread_cond_wait(&proc->cond, &proc->lock);
+	pthread_mutex_unlock(&proc->lock);
+}
+
+static void blkio_processor_insert_buffer(struct blkio_processor *proc,
+			struct blkio_buffer *buf)
+{
+	struct rb_node **plink = &proc->buffers.rb_node;
+	struct rb_node *parent = 0;
+
+	while (*plink) {
+		struct blkio_buffer *b = rb_entry(*plink, struct blkio_buffer,
+					node);
+
+		parent = *plink;
+
+		if (b->timestamp < buf->timestamp)
+			plink = &parent->rb_right;
+		else
+			plink = &parent->rb_left;
+	}
+
+	rb_link_node(&buf->node, parent, plink);
+	rb_insert_color(&buf->node, &proc->buffers);
+}
+
+static void blkio_processor_populate_list(struct blkio_processor *proc,
+			struct list_head *head)
+{
+	struct list_head *ptr = head->next;
+
+	while (ptr != head) {
+		struct blkio_buffer *buf = list_entry(ptr, struct blkio_buffer,
+					head);
+
+		ptr = ptr->next;
+		blkio_processor_insert_buffer(proc, buf);
+	}
+}
+
+static void blkio_processor_populate(struct blkio_processor *proc)
+{
+	struct blkio_record_ctx *ctx = proc->ctx;
+	struct list_head *head = &ctx->tracers;
+	struct list_head *ptr = head->next;
+
+	while (ptr != head) {
+		struct blkio_tracer *tracer = list_entry(ptr,
+					struct blkio_tracer, link);
+
+		ptr = ptr->next;
+
+		struct list_head buffers;
+
+		list_head_init(&buffers);
+
+		pthread_mutex_lock(&tracer->lock);
+		list_splice(&buffers, &tracer->bufs);
+		pthread_mutex_unlock(&tracer->lock);
+
+		blkio_processor_populate_list(proc, &buffers);
+	}
+}
+
+static void __blkio_processor_release_buffers(struct rb_node *node)
+{
+	while (node) {
+		struct blkio_buffer *buf = rb_entry(node, struct blkio_buffer,
+					node);
+
+		__blkio_processor_release_buffers(node->rb_right);
+		node = node->rb_left;
+		blkio_free_buffer(buf);
+	}
+}
+
+static void blkio_processor_release_buffers(struct blkio_processor *proc)
+{
+	__blkio_processor_release_buffers(proc->buffers.rb_node);
+	proc->buffers.rb_node = 0;
+}
+
+static void *blkio_processor_main(void *data)
+{
+	struct blkio_processor *proc = data;
+
+	blkio_processor_wait(proc);
+
+	while (proc->state == TRACE_RUN) {
+		blkio_processor_populate(proc);
+		blkio_processor_release_buffers(proc);
+		pthread_yield();
+	}
+
+	blkio_processor_populate(proc);
+	blkio_processor_release_buffers(proc);
+
+	return 0;
+}
+
+static int blkio_tracer_read(struct blkio_tracer *tracer)
+{
+	struct blkio_buffer *buffer = blkio_alloc_buffer(BLKIO_BUFFER_SIZE);
+
+	if (!buffer) {
+		fprintf(stderr, "blkio_buffer allocation failed\n");
+		return 1;
+	}
+
+	buffer->size = read(tracer->fd, buffer->data, BLKIO_BUFFER_SIZE);
+	if (buffer->size <= 0) {
+		blkio_free_buffer(buffer);
+		return 1;
+	}
+
+	buffer->timestamp = blkio_timestamp();
+	buffer->tracer = tracer;
+
+	pthread_mutex_lock(&tracer->lock);
+	list_link_before(&tracer->bufs, &buffer->head);
+	pthread_mutex_unlock(&tracer->lock);
+
+	return 0;
+}
 
 static void *blkio_tracer_main(void *data)
 {
 	struct blkio_tracer *tracer = data;
-	struct blkio_record_ctx *ctx = tracer->ctx;
 	struct pollfd pollfd;
 
 	pthread_setaffinity_np(tracer->thread, sizeof(tracer->cpuset),
@@ -75,9 +222,9 @@ static void *blkio_tracer_main(void *data)
 	pollfd.events = POLLIN;
 	pollfd.revents = 0;
 
-	blkio_trace_wait(ctx);
+	blkio_tracer_wait(tracer);
 
-	while (ctx->state == TRACE_RUN) {
+	while (tracer->state == TRACE_RUN) {
 		const int rc = poll(&pollfd, 1, 500);
 
 		if (rc < 0) {
@@ -88,47 +235,32 @@ static void *blkio_tracer_main(void *data)
 		if (!(pollfd.revents & POLLIN))
 			continue;
 
-		struct blkio_buffer *buffer =
-			blkio_buffer_alloc(BLKIO_BUFFER_SIZE);
-
-		if (!buffer) {
-			fprintf(stderr, "blkio_buffer allocation failed\n");
-			continue;
-		}
-
-		buffer->size = read(tracer->fd, buffer->data,
-			BLKIO_BUFFER_SIZE);
-		if (buffer->size <= 0) {
-			blkio_buffer_free(buffer);
-			continue;
-		}
-
-		pthread_mutex_lock(&tracer->lock);
-		list_link_before(&tracer->bufs, &buffer->link);
-		pthread_mutex_unlock(&tracer->lock);
+		while (!blkio_tracer_read(tracer));
 	}
+
+	while (!blkio_tracer_read(tracer));
 
 	return 0;
 }
 
 static int blkio_trace_open_cpu(struct blkio_record_ctx *ctx, int cpu)
 {
-	static const char *debugfs = "/sys/kernel/debug";
 	char filename[PATH_MAX + 64];
 
 	const size_t size = snprintf(filename, sizeof(filename),
-		"%s/block/%s/trace%d", debugfs, ctx->trace_setup.name, cpu);
+		"%s/block/%s/trace%d", DEBUGFS, ctx->trace_setup.name, cpu);
 
 	assert(size < sizeof(filename));
 
 	return open(filename, O_RDONLY | O_NONBLOCK);
 }
 
-static int blkio_tracer_start(struct blkio_tracer *tracer, int cpu)
+static int blkio_start_tracer(struct blkio_record_ctx *ctx,
+			struct blkio_tracer *tracer, int cpu)
 {
 	CPU_SET(cpu, &tracer->cpuset);
 
-	tracer->fd = blkio_trace_open_cpu(tracer->ctx, cpu);
+	tracer->fd = blkio_trace_open_cpu(ctx, cpu);
 	if (tracer->fd < 0) {
 		perror("Cannot open trace file: ");
 		return -1;
@@ -142,7 +274,14 @@ static int blkio_tracer_start(struct blkio_tracer *tracer, int cpu)
 	return 0;
 }
 
-static void blkio_tracer_wait(struct blkio_tracer *tracer)
+static int blkio_start_processor(struct blkio_processor *proc)
+{
+	if (pthread_create(&proc->thread, 0, blkio_processor_main, proc))
+		return -1;
+	return 0;
+}
+
+static void blkio_wait_tracer(struct blkio_tracer *tracer)
 {
 	assert(!pthread_join(tracer->thread, NULL));
 	if (tracer->fd >= 0)
@@ -150,23 +289,7 @@ static void blkio_tracer_wait(struct blkio_tracer *tracer)
 	tracer->fd = -1;
 }
 
-static void blkio_tracers_stop(struct blkio_record_ctx *ctx)
-{
-	pthread_mutex_lock(&ctx->lock);
-	ctx->state = TRACE_STOP;
-	pthread_cond_broadcast(&ctx->cond);
-	pthread_mutex_unlock(&ctx->lock);
-}
-
-static void blkio_tracers_run(struct blkio_record_ctx *ctx)
-{
-	pthread_mutex_lock(&ctx->lock);
-	ctx->state = TRACE_RUN;
-	pthread_cond_broadcast(&ctx->cond);
-	pthread_mutex_unlock(&ctx->lock);
-}
-
-static void blkio_tracers_wait(struct blkio_record_ctx *ctx)
+static void blkio_tracers_set_state(struct blkio_record_ctx *ctx, int state)
 {
 	struct list_head *head = &ctx->tracers;
 	struct list_head *ptr = head->next;
@@ -176,11 +299,40 @@ static void blkio_tracers_wait(struct blkio_record_ctx *ctx)
 					struct blkio_tracer, link);
 
 		ptr = ptr->next;
-		blkio_tracer_wait(tracer);
+
+		pthread_mutex_lock(&tracer->lock);
+		tracer->state = state;
+		pthread_cond_broadcast(&tracer->cond);
+		pthread_mutex_unlock(&tracer->lock);
 	}
 }
 
-static void blkio_tracers_destroy(struct blkio_record_ctx *ctx)
+static void blkio_stop_tracers(struct blkio_record_ctx *ctx)
+{ blkio_tracers_set_state(ctx, TRACE_STOP); }
+
+static void blkio_run_tracers(struct blkio_record_ctx *ctx)
+{ blkio_tracers_set_state(ctx, TRACE_RUN); }
+
+static void blkio_run_processor(struct blkio_record_ctx *ctx)
+{
+	pthread_mutex_lock(&ctx->processor.lock);
+	ctx->processor.state = TRACE_RUN;
+	pthread_cond_broadcast(&ctx->processor.cond);
+	pthread_mutex_unlock(&ctx->processor.lock);
+}
+
+static void blkio_stop_processor(struct blkio_record_ctx *ctx)
+{
+	pthread_mutex_lock(&ctx->processor.lock);
+	ctx->processor.state = TRACE_STOP;
+	pthread_cond_broadcast(&ctx->processor.cond);
+	pthread_mutex_unlock(&ctx->processor.lock);
+}
+
+static void blkio_wait_processor(struct blkio_record_ctx *ctx)
+{ assert(!pthread_join(ctx->processor.thread, NULL)); }
+
+static void blkio_wait_tracers(struct blkio_record_ctx *ctx)
 {
 	struct list_head *head = &ctx->tracers;
 	struct list_head *ptr = head->next;
@@ -190,80 +342,107 @@ static void blkio_tracers_destroy(struct blkio_record_ctx *ctx)
 					struct blkio_tracer, link);
 
 		ptr = ptr->next;
-		blkio_tracer_free(tracer);
+		blkio_wait_tracer(tracer);
 	}
 }
 
-static int blkio_tracers_create(struct blkio_record_ctx *ctx)
+static void blkio_destroy_tracers(struct blkio_record_ctx *ctx)
 {
+	struct list_head *head = &ctx->tracers;
+	struct list_head *ptr = head->next;
+
+	while (ptr != head) {
+		struct blkio_tracer *tracer = list_entry(ptr,
+					struct blkio_tracer, link);
+
+		ptr = ptr->next;
+		blkio_free_tracer(tracer);
+	}
+}
+
+static int blkio_create_tracers(struct blkio_record_ctx *ctx)
+{
+	int rc = 0;
+
 	for (int i = 0; i != ctx->cpus; ++i) {
-		struct blkio_tracer *tracer = blkio_tracer_alloc(ctx);
+		struct blkio_tracer *tracer = blkio_alloc_tracer();
 
 		if (!tracer) {
-			blkio_tracers_stop(ctx);
-			blkio_tracers_wait(ctx);
-			blkio_tracers_destroy(ctx);
-			return -1;
+			rc = -1;
+			break;
 		}
 
-		if (blkio_tracer_start(tracer, i)) {
-			blkio_tracer_free(tracer);
-			return -1;
+		if (blkio_start_tracer(ctx, tracer, i)) {
+			blkio_free_tracer(tracer);
+			rc = -1;
+			break;
 		}
 
 		list_link_before(&ctx->tracers, &tracer->link);
 	}
-	return 0;
+
+	if (rc) {
+		blkio_stop_tracers(ctx);
+		blkio_wait_tracers(ctx);
+	}
+
+	return rc;
 }
 
-static void blkio_trace_wait(struct blkio_record_ctx *ctx)
+static void blkio_destroy_processor(struct blkio_record_ctx *ctx)
 {
-	pthread_mutex_lock(&ctx->lock);
-	while (ctx->state == TRACE_WAIT)
-		pthread_cond_wait(&ctx->cond, &ctx->lock);
-	pthread_mutex_unlock(&ctx->lock);
+	assert(!pthread_mutex_destroy(&ctx->processor.lock));
+	assert(!pthread_cond_destroy(&ctx->processor.cond));	
+}
+
+static int blkio_create_processor(struct blkio_record_ctx *ctx)
+{
+	assert(!pthread_mutex_init(&ctx->processor.lock, NULL));
+	assert(!pthread_cond_init(&ctx->processor.cond, NULL));
+	ctx->processor.state = TRACE_WAIT;
+	ctx->processor.ctx = ctx;
+	return blkio_start_processor(&ctx->processor);
 }
 
 static int blkio_trace_start(struct blkio_record_ctx *ctx)
 {
 	if (ioctl(ctx->fd, BLKTRACESTART))
 		return -1;
-	blkio_tracers_run(ctx);
+	blkio_run_processor(ctx);
+	blkio_run_tracers(ctx);
 	return 0;
 }
 
 static void blkio_trace_stop(struct blkio_record_ctx *ctx)
 {
 	ioctl(ctx->fd, BLKTRACESTOP);
-	blkio_tracers_stop(ctx);
-	blkio_tracers_wait(ctx);
+	blkio_stop_tracers(ctx);
+	blkio_wait_tracers(ctx);
+	blkio_stop_processor(ctx);
+	blkio_wait_processor(ctx);
 }
 
 static void blkio_record_ctx_release(struct blkio_record_ctx *ctx)
 {
-	blkio_tracers_destroy(ctx);
+	blkio_destroy_tracers(ctx);
+	blkio_destroy_processor(ctx);
 	if (ctx->fd >= 0) {
 		ioctl(ctx->fd, BLKTRACESTOP);
 		ioctl(ctx->fd, BLKTRACETEARDOWN);
 		close(ctx->fd);
 	}
-	assert(!pthread_mutex_destroy(&ctx->lock));
-	assert(!pthread_cond_destroy(&ctx->cond));
 }
 
 static int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
 			const char *block_device_name)
 {
+	memset(ctx, 0, sizeof(*ctx));;
 	list_head_init(&ctx->tracers);
-	assert(!pthread_mutex_init(&ctx->lock, NULL));
-	assert(!pthread_cond_init(&ctx->cond, NULL));
 
-	memset(&ctx->trace_setup, 0, sizeof(ctx->trace_setup));
 	ctx->trace_setup.act_mask = BLK_TC_QUEUE | BLK_TC_COMPLETE;
 	ctx->trace_setup.buf_size = BLKIO_BUFFER_SIZE;
 	ctx->trace_setup.buf_nr = 4;
 
-	ctx->state = TRACE_WAIT;
 	ctx->cpus = -1;
 	ctx->fd = -1;
 
@@ -287,7 +466,14 @@ static int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
 		return -1;
 	}
 
-	if (blkio_tracers_create(ctx)) {
+	if (blkio_create_processor(ctx)) {
+		blkio_record_ctx_release(ctx);
+		return -1;
+	}
+
+	if (blkio_create_tracers(ctx)) {
+		blkio_stop_processor(ctx);
+		blkio_wait_processor(ctx);
 		blkio_record_ctx_release(ctx);
 		return -1;
 	}
@@ -304,14 +490,43 @@ static long blkio_release_traces(struct blkio_tracer *tracer)
 
 	while (head != ptr) {
 		struct blkio_buffer *buf = list_entry(ptr, struct blkio_buffer,
-			link);
+			head);
 
 		ptr = ptr->next;
 		bytes += buf->size;
-		blkio_buffer_free(buf);
+		blkio_free_buffer(buf);
 	}
 
 	return bytes;
+}
+
+static int blkio_get_drops(struct blkio_record_ctx *ctx)
+{
+	char filename[PATH_MAX + 64];
+
+	const size_t size = snprintf(filename, sizeof(filename),
+		"%s/block/%s/dropped", DEBUGFS, ctx->trace_setup.name);
+
+	assert(size < sizeof(filename));
+
+	int fd = open(filename, O_RDONLY);
+
+	if (fd < 0) {
+		perror("Cannot open drop counter: ");
+		return 0;
+	}
+
+	char tmp[256];
+	int count = 0;
+
+	memset(tmp, 0, sizeof(tmp));
+	if (read(fd, tmp, sizeof(tmp) - 1) < 0)
+		perror("Failed to read drop counter: ");
+	else
+		count = atoi(tmp);
+
+	close(fd);
+	return count;
 }
 
 static int trace_device(const char *block_device_name)
@@ -325,21 +540,7 @@ static int trace_device(const char *block_device_name)
 	sleep(5);
 	blkio_trace_stop(&ctx);
 
-
-	struct list_head *head = &ctx.tracers;
-	struct list_head *ptr = head->next;
-
-	long total_bytes = 0;
-
-	for (; head != ptr; ptr = ptr->next) {
-		struct blkio_tracer *tracer = list_entry(ptr,
-			struct blkio_tracer, link);
-
-		total_bytes = blkio_release_traces(tracer);
-	}
-
-	printf("total bytes read: %ld\n", total_bytes);
-
+	printf("buffer dropped: %d\n", blkio_get_drops(&ctx));
 	blkio_record_ctx_release(&ctx);
 	return 0;
 }
