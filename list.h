@@ -18,6 +18,7 @@ static inline int list_empty(const struct list_head *head)
 
 void list_link_after(struct list_head *pos, struct list_head *new);
 void list_link_before(struct list_head *pos, struct list_head *new);
+void list_splice(struct list_head *pos, struct list_head *lst);
 void list_unlink(struct list_head *pos);
 
 #endif /*__LIST_H__*/
