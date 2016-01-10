@@ -19,9 +19,6 @@
 #include <errno.h>
 
 
-#define BLKIO_BUFFER_SIZE (512 * 1024)
-#define DEBUGFS           "/sys/kernel/debug"
-
 static struct blkio_buffer *blkio_alloc_buffer(size_t size)
 {
 	void *ptr = malloc(sizeof(struct blkio_buffer) + size);
@@ -52,7 +49,6 @@ static struct blkio_tracer *blkio_alloc_tracer(void)
 	assert(!pthread_mutex_init(&tracer->lock, NULL));
 	assert(!pthread_cond_init(&tracer->cond, NULL));
 	CPU_ZERO(&tracer->cpuset);
-	tracer->prev = 0;
 	tracer->state = TRACE_WAIT;
 	tracer->fd = -1;
 	return tracer;
@@ -62,7 +58,6 @@ static void blkio_free_tracer(struct blkio_tracer *tracer)
 {
 	assert(!pthread_mutex_destroy(&tracer->lock));
 	assert(!pthread_cond_destroy(&tracer->cond));
-	blkio_free_buffer(tracer->prev);
 	free(tracer);
 }
 
@@ -242,9 +237,10 @@ static int blkio_read_traces(struct blkio_tracer *tracer,
 			char *buffer, size_t *size)
 {
 	const size_t trace_size = sizeof(struct blk_io_trace);
-	const size_t max_count = BLKIO_BUFFER_SIZE / trace_size;
+	const size_t buffer_size = tracer->ctx->conf->buffer_size;
+	const size_t max_count = buffer_size / trace_size;
 
-	ssize_t rd = read(tracer->fd, buffer + *size, BLKIO_BUFFER_SIZE);
+	ssize_t rd = read(tracer->fd, buffer + *size, buffer_size);
 	struct blkio_buffer *traces = 0;
 	size_t pos = 0;
 
@@ -253,7 +249,7 @@ static int blkio_read_traces(struct blkio_tracer *tracer,
 
 		while (*size - pos >= trace_size) {
 			if (!traces)
-				traces = blkio_alloc_buffer(BLKIO_BUFFER_SIZE);
+				traces = blkio_alloc_buffer(buffer_size);
 
 			if (!traces)
 				return -1;
@@ -280,7 +276,7 @@ static int blkio_read_traces(struct blkio_tracer *tracer,
 			memmove(buffer, buffer + pos, *size - pos);
 		*size -= pos;
 		pos = 0;
-		rd = read(tracer->fd, buffer + *size, BLKIO_BUFFER_SIZE);
+		rd = read(tracer->fd, buffer + *size, buffer_size);
 	}
 
 	blkio_submit_traces(tracer, traces);
@@ -290,9 +286,10 @@ static int blkio_read_traces(struct blkio_tracer *tracer,
 static void *blkio_tracer_main(void *data)
 {
 	struct blkio_tracer *tracer = data;
+	struct blkio_record_ctx *ctx = tracer->ctx;
 	struct pollfd pollfd;
 
-	char *buffer = malloc(3 * BLKIO_BUFFER_SIZE);
+	char *buffer = malloc(3 * ctx->conf->buffer_size);
 	size_t size = 0;
 
 	if (!buffer)
@@ -334,7 +331,10 @@ static int blkio_trace_open_cpu(struct blkio_record_ctx *ctx, int cpu)
 	char filename[PATH_MAX + 64];
 
 	const size_t size = snprintf(filename, sizeof(filename),
-		"%s/block/%s/trace%d", DEBUGFS, ctx->trace_setup.name, cpu);
+				"%s/block/%s/trace%d",
+				ctx->conf->debugfs,
+				ctx->trace_setup.name,
+				cpu);
 
 	assert(size < sizeof(filename));
 
@@ -345,7 +345,7 @@ static int blkio_start_tracer(struct blkio_record_ctx *ctx,
 			struct blkio_tracer *tracer, int cpu)
 {
 	CPU_SET(cpu, &tracer->cpuset);
-
+	tracer->ctx = ctx;
 	tracer->fd = blkio_trace_open_cpu(ctx, cpu);
 	if (tracer->fd < 0) {
 		perror("Cannot open trace file: ");
@@ -520,14 +520,15 @@ static void blkio_record_ctx_release(struct blkio_record_ctx *ctx)
 }
 
 static int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
-			const char *block_device_name)
+			struct blkio_record_conf *conf)
 {
 	memset(ctx, 0, sizeof(*ctx));;
 	list_head_init(&ctx->tracers);
 
 	ctx->trace_setup.act_mask = BLK_TC_QUEUE | BLK_TC_COMPLETE;
-	ctx->trace_setup.buf_size = BLKIO_BUFFER_SIZE;
-	ctx->trace_setup.buf_nr = 4;
+	ctx->trace_setup.buf_size = conf->buffer_size;
+	ctx->trace_setup.buf_nr = conf->buffer_count;
+	ctx->conf = conf;
 
 	ctx->cpus = -1;
 	ctx->fd = -1;
@@ -539,7 +540,7 @@ static int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
 		return -1;
 	}
 
-	ctx->fd = open(block_device_name, O_RDONLY | O_NONBLOCK);
+	ctx->fd = open(conf->device, O_RDONLY | O_NONBLOCK);
 	if (ctx->fd < 0) {
 		perror("Cannot open block device: ");
 		blkio_record_ctx_release(ctx);
@@ -572,7 +573,9 @@ static int blkio_get_drops(struct blkio_record_ctx *ctx)
 	char filename[PATH_MAX + 64];
 
 	const size_t size = snprintf(filename, sizeof(filename),
-		"%s/block/%s/dropped", DEBUGFS, ctx->trace_setup.name);
+				"%s/block/%s/dropped",
+				ctx->conf->debugfs,
+				ctx->trace_setup.name);
 
 	assert(size < sizeof(filename));
 
@@ -605,11 +608,11 @@ static void finish_tracing(int sig)
 	done = 1;
 }
 
-static int trace_device(const char *block_device_name)
+static int trace_device(struct blkio_record_conf *conf)
 {
 	struct blkio_record_ctx ctx;
 
-	if (blkio_record_ctx_setup(&ctx, block_device_name))
+	if (blkio_record_ctx_setup(&ctx, conf))
 		return -1;
 
 	blkio_trace_start(&ctx);
@@ -624,10 +627,17 @@ static int trace_device(const char *block_device_name)
 
 int main()
 {
+	struct blkio_record_conf conf = {
+		"/sys/kernel/debug",
+		"/dev/nullb0",
+		512 * 1024,
+		4
+	};
+
 	handle_signal(SIGINT, finish_tracing);
 	handle_signal(SIGHUP, finish_tracing);
 	handle_signal(SIGTERM, finish_tracing);
 
-	trace_device("/dev/nullb0");
+	trace_device(&conf);
 	return 0;
 }

@@ -24,9 +24,9 @@ enum blkio_tracer_state {
 };
 
 struct blkio_tracer {
+	struct blkio_record_ctx *ctx;
 	struct list_head link;
 	struct list_head bufs;
-	struct blkio_buffer *prev;
 	pthread_t thread;
 	pthread_mutex_t lock;
 	pthread_cond_t cond;
@@ -46,10 +46,18 @@ struct blkio_processor {
 	volatile int state;
 };
 
+struct blkio_record_conf {
+	const char *debugfs;
+	const char *device;
+	size_t buffer_size;
+	size_t buffer_count;
+};
+
 struct blkio_record_ctx {
 	struct blk_user_trace_setup trace_setup;
 	struct blkio_processor processor;
 	struct list_head tracers;
+	struct blkio_record_conf *conf;
 	int cpus;
 	int fd;
 };
