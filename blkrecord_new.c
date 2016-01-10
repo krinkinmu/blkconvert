@@ -151,13 +151,14 @@ static void blkio_processor_unlink(struct blkio_processor *proc,
 			struct blkio_buffer *buf)
 { rb_erase(&buf->node, &proc->buffers); }
 
-static void blkio_trace_to_cpu(struct blk_io_trace *trace)
+static int blkio_trace_to_cpu(struct blk_io_trace *trace)
 {
 	if ((trace->magic & 0xFFFFFF00ul) == BLK_IO_TRACE_MAGIC)
-		return;
+		return 0;
 
 	trace->magic = __bswap_32(trace->magic);
-	assert((trace->magic & 0xFFFFFF00ul) == BLK_IO_TRACE_MAGIC);
+	if ((trace->magic & 0xFFFFFF00ul) != BLK_IO_TRACE_MAGIC)
+		return -1;
 
 	trace->time = __bswap_64(trace->time);
 	trace->sector = __bswap_64(trace->sector);
@@ -166,6 +167,7 @@ static void blkio_trace_to_cpu(struct blk_io_trace *trace)
 	trace->pdu_len = __bswap_16(trace->pdu_len);
 	trace->pid = __bswap_32(trace->pid);
 	trace->cpu = __bswap_32(trace->cpu);
+	return 0;
 }
 
 static void blkio_print_trace(struct blk_io_trace *trace)
@@ -233,6 +235,22 @@ static void blkio_submit_traces(struct blkio_tracer *tracer,
 	pthread_mutex_unlock(&tracer->lock);
 }
 
+static int blkio_accept_trace(struct blk_io_trace *trace)
+{
+	if (!trace->bytes)
+		return 0;
+
+	if ((trace->action & BLK_TC_ACT(BLK_TC_QUEUE)) &&
+	    (trace->action & 0xFFFFu) == __BLK_TA_QUEUE)
+		return 1;
+
+	if ((trace->action & BLK_TC_ACT(BLK_TC_COMPLETE)) &&
+	    (trace->action & 0xFFFFu) == __BLK_TA_COMPLETE)
+		return 1;
+
+	return 0;
+}
+
 static int blkio_read_traces(struct blkio_tracer *tracer,
 			char *buffer, size_t *size)
 {
@@ -258,7 +276,9 @@ static int blkio_read_traces(struct blkio_tracer *tracer,
 						traces->data + traces->count;
 
 			memcpy(trace, buffer + pos, trace_size);
-			blkio_trace_to_cpu(trace);
+
+			if (blkio_trace_to_cpu(trace))
+				return -1;
 
 			const size_t skip = trace_size + trace->pdu_len;
 
@@ -266,6 +286,10 @@ static int blkio_read_traces(struct blkio_tracer *tracer,
 				break;
 
 			pos += skip;
+
+			if (!blkio_accept_trace(trace))
+				continue;
+
 			if (++traces->count == max_count) {
 				blkio_submit_traces(tracer, traces);
 				traces = 0;
@@ -522,14 +546,14 @@ static void blkio_record_ctx_release(struct blkio_record_ctx *ctx)
 static int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
 			struct blkio_record_conf *conf)
 {
-	memset(ctx, 0, sizeof(*ctx));;
+	memset(ctx, 0, sizeof(*ctx));
 	list_head_init(&ctx->tracers);
 
 	ctx->trace_setup.act_mask = BLK_TC_QUEUE | BLK_TC_COMPLETE;
 	ctx->trace_setup.buf_size = conf->buffer_size;
 	ctx->trace_setup.buf_nr = conf->buffer_count;
-	ctx->conf = conf;
 
+	ctx->conf = conf;
 	ctx->cpus = -1;
 	ctx->fd = -1;
 
@@ -620,7 +644,7 @@ static int trace_device(struct blkio_record_conf *conf)
 		pause();
 	blkio_trace_stop(&ctx);
 
-	printf("buffer dropped: %d\n", blkio_get_drops(&ctx));
+	fprintf(stderr, "buffers dropped: %d\n", blkio_get_drops(&ctx));
 	blkio_record_ctx_release(&ctx);
 	return 0;
 }
