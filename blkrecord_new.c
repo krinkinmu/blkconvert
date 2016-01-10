@@ -1,8 +1,10 @@
 #include "blkrecord_new.h"
+#include "blktrace_api.h"
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <byteswap.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
@@ -52,6 +54,7 @@ static struct blkio_tracer *blkio_alloc_tracer(void)
 	assert(!pthread_mutex_init(&tracer->lock, NULL));
 	assert(!pthread_cond_init(&tracer->cond, NULL));
 	CPU_ZERO(&tracer->cpuset);
+	tracer->prev = 0;
 	tracer->state = TRACE_WAIT;
 	tracer->fd = -1;
 	return tracer;
@@ -61,6 +64,7 @@ static void blkio_free_tracer(struct blkio_tracer *tracer)
 {
 	assert(!pthread_mutex_destroy(&tracer->lock));
 	assert(!pthread_cond_destroy(&tracer->cond));
+	blkio_free_buffer(tracer->prev);
 	free(tracer);
 }
 
@@ -149,6 +153,7 @@ static void blkio_processor_populate(struct blkio_processor *proc)
 	}
 }
 
+/*
 static void __blkio_processor_release_buffers(struct rb_node *node)
 {
 	while (node) {
@@ -166,6 +171,127 @@ static void blkio_processor_release_buffers(struct blkio_processor *proc)
 	__blkio_processor_release_buffers(proc->buffers.rb_node);
 	proc->buffers.rb_node = 0;
 }
+*/
+
+static struct blkio_buffer *blkio_processor_peek(struct blkio_processor *proc)
+{
+	struct rb_node *first = rb_first(&proc->buffers);
+
+	if (!first)
+		return 0;
+
+	return rb_entry(first, struct blkio_buffer, node);
+}
+
+static void blkio_processor_unlink(struct blkio_processor *proc,
+			struct blkio_buffer *buf)
+{ rb_erase(&buf->node, &proc->buffers); }
+
+static void blkio_coalesce_buffers(struct blkio_buffer *prev,
+			struct blkio_buffer *next)
+{
+	const int prev_size = prev->size - prev->pos;
+
+	memmove(next->data + prev_size, next->data, next->size);
+	memcpy(next->data, prev->data + prev->pos, prev_size);
+	next->size += prev_size;
+}
+
+static void blkio_trace_to_cpu(struct blk_io_trace *trace)
+{
+	if ((trace->magic & 0xFFFFFF00ul) == BLK_IO_TRACE_MAGIC)
+		return;
+
+	trace->magic = __bswap_32(trace->magic);
+	assert((trace->magic & 0xFFFFFF00ul) == BLK_IO_TRACE_MAGIC);
+
+	trace->time = __bswap_64(trace->time);
+	trace->sector = __bswap_64(trace->sector);
+	trace->bytes = __bswap_32(trace->bytes);
+	trace->action = __bswap_32(trace->action);
+	trace->pdu_len = __bswap_16(trace->pdu_len);
+	trace->pid = __bswap_32(trace->pid);
+	trace->cpu = __bswap_32(trace->cpu);
+}
+
+static void blkio_print_trace(struct blk_io_trace *trace)
+{
+	printf("time: %llu, sector: %llu, bytes: %lu, pid: %lu, cpu: %lu\n",
+		(unsigned long long) trace->time,
+		(unsigned long long) trace->sector,
+		(unsigned long) trace->bytes,
+		(unsigned long) trace->pid,
+		(unsigned long) trace->cpu);
+}
+
+static void blkio_processor_handle_buffer(struct blkio_buffer *buf)
+{
+	struct blkio_tracer *tracer = buf->tracer;
+	struct blkio_buffer *prev = tracer->prev;
+	struct blk_io_trace trace;
+	char *data = (void *)&trace;
+
+	if (prev) {
+		const size_t prev_size = prev->size - prev->pos;
+		const size_t curr_size = buf->size;
+
+		if (prev_size + curr_size < sizeof(trace)) {
+			blkio_coalesce_buffers(prev, buf);
+			tracer->prev = buf;
+			blkio_free_buffer(prev);
+			return;
+		}
+
+		memcpy(data, prev->data + prev->pos, prev_size);
+		memcpy(data + prev_size, buf->data, sizeof(trace) - prev_size);
+		blkio_trace_to_cpu(&trace);
+
+		if (sizeof(trace) + trace.pdu_len > prev_size + curr_size) {
+			blkio_coalesce_buffers(prev, buf);
+			tracer->prev = buf;
+			blkio_free_buffer(prev);
+			return;
+		}
+
+		tracer->prev = 0;
+		blkio_free_buffer(prev);
+		buf->pos += sizeof(trace) + trace.pdu_len - prev_size;
+		blkio_print_trace(&trace);
+	}
+
+	while (1) {
+		if (buf->size - buf->pos < sizeof(trace))
+			break;
+
+		memcpy(data, buf->data + buf->pos, sizeof(trace));
+		blkio_trace_to_cpu(&trace);
+
+		if (sizeof(trace) + trace.pdu_len > buf->size - buf->pos)
+			break;
+
+		buf->pos += sizeof(trace) + trace.pdu_len;
+
+		blkio_print_trace(&trace);
+	}
+
+	if (buf->pos != buf->size)
+		tracer->prev = buf;
+	else
+		blkio_free_buffer(buf);
+}
+
+static void blkio_processor_handle(struct blkio_processor *proc)
+{
+	struct blkio_buffer *buf = blkio_processor_peek(proc);
+
+	while (buf) {
+		struct rb_node *next = rb_next(&buf->node);
+
+		blkio_processor_unlink(proc, buf);
+		blkio_processor_handle_buffer(buf);
+		buf = next ? (rb_entry(next, struct blkio_buffer, node)) : 0;
+	}
+}
 
 static void *blkio_processor_main(void *data)
 {
@@ -175,12 +301,12 @@ static void *blkio_processor_main(void *data)
 
 	while (proc->state == TRACE_RUN) {
 		blkio_processor_populate(proc);
-		blkio_processor_release_buffers(proc);
+		blkio_processor_handle(proc);
 		pthread_yield();
 	}
 
 	blkio_processor_populate(proc);
-	blkio_processor_release_buffers(proc);
+	blkio_processor_handle(proc);
 
 	return 0;
 }
@@ -225,7 +351,7 @@ static void *blkio_tracer_main(void *data)
 	blkio_tracer_wait(tracer);
 
 	while (tracer->state == TRACE_RUN) {
-		const int rc = poll(&pollfd, 1, 500);
+		const int rc = poll(&pollfd, 1, 50);
 
 		if (rc < 0) {
 			perror("Poll failed: ");
@@ -481,6 +607,7 @@ static int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
 	return 0;
 }
 
+/*
 static long blkio_release_traces(struct blkio_tracer *tracer)
 {
 	struct list_head *head = &tracer->bufs;
@@ -499,6 +626,7 @@ static long blkio_release_traces(struct blkio_tracer *tracer)
 
 	return bytes;
 }
+*/
 
 static int blkio_get_drops(struct blkio_record_ctx *ctx)
 {

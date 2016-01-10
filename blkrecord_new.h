@@ -15,7 +15,7 @@ struct blkio_buffer {
 	unsigned long long timestamp;
 	struct blkio_tracer *tracer;
 	void *data;
-	int pos, size;
+	size_t pos, size;
 };
 
 enum blkio_tracer_state {
@@ -27,6 +27,7 @@ enum blkio_tracer_state {
 struct blkio_tracer {
 	struct list_head link;
 	struct list_head bufs;
+	struct blkio_buffer *prev;
 	pthread_t thread;
 	pthread_mutex_t lock;
 	pthread_cond_t cond;
