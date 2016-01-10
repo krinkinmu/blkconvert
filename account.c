@@ -280,9 +280,6 @@ int account_events(const struct blkio_event *events, size_t size,
 		return 0;
 
 	memset(stats, 0, sizeof(*stats));
-	stats->pid = events->pid;
-	stats->cpu = events->cpu;
-
 	if (account_general_stats(stats, events, size))
 		return 1;
 

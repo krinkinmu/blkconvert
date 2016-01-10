@@ -407,6 +407,9 @@ static void process_info_dump(struct blkio_record_context *ctx,
 		if (st.reads + st.writes == 0)
 			return;
 
+		st.pid = 0;
+		st.cpu = 0;
+
 		mygzwrite(ctx->zofd, (const char *)&st, sizeof(st));
 	}	
 }
