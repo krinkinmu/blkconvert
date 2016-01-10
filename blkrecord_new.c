@@ -101,7 +101,7 @@ static void blkio_processor_insert_buffer(struct blkio_processor *proc,
 
 		parent = *plink;
 
-		if (b->timestamp < buf->timestamp)
+		if (b->timestamp <= buf->timestamp)
 			plink = &parent->rb_right;
 		else
 			plink = &parent->rb_left;
