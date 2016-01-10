@@ -7,7 +7,6 @@
 #include <byteswap.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <time.h>
 #include <poll.h>
 
 #include <stddef.h>
@@ -22,7 +21,7 @@
 #define BLKIO_BUFFER_SIZE (512 * 1024)
 #define DEBUGFS           "/sys/kernel/debug"
 
-static struct blkio_buffer *blkio_alloc_buffer(int size)
+static struct blkio_buffer *blkio_alloc_buffer(size_t size)
 {
 	void *ptr = malloc(sizeof(struct blkio_buffer) + size);
 
@@ -34,8 +33,6 @@ static struct blkio_buffer *blkio_alloc_buffer(int size)
 	memset(buffer, 0, sizeof(*buffer));
 	list_head_init(&buffer->head);
 	buffer->data = (void *)(buffer + 1);
-	buffer->size = size;
-
 	return buffer;
 }
 
@@ -66,15 +63,6 @@ static void blkio_free_tracer(struct blkio_tracer *tracer)
 	assert(!pthread_cond_destroy(&tracer->cond));
 	blkio_free_buffer(tracer->prev);
 	free(tracer);
-}
-
-static unsigned long long blkio_timestamp(void)
-{
-	static const unsigned long long NS = 1000000000ull;
-	struct timespec sp;
-
-	clock_gettime(CLOCK_MONOTONIC_RAW, &sp);
-	return sp.tv_sec * NS + sp.tv_nsec;
 }
 
 static void blkio_tracer_wait(struct blkio_tracer *tracer)
@@ -167,16 +155,6 @@ static void blkio_processor_unlink(struct blkio_processor *proc,
 			struct blkio_buffer *buf)
 { rb_erase(&buf->node, &proc->buffers); }
 
-static void blkio_coalesce_buffers(struct blkio_buffer *prev,
-			struct blkio_buffer *next)
-{
-	const int prev_size = prev->size - prev->pos;
-
-	memmove(next->data + prev_size, next->data, next->size);
-	memcpy(next->data, prev->data + prev->pos, prev_size);
-	next->size += prev_size;
-}
-
 static void blkio_trace_to_cpu(struct blk_io_trace *trace)
 {
 	if ((trace->magic & 0xFFFFFF00ul) == BLK_IO_TRACE_MAGIC)
@@ -206,58 +184,9 @@ static void blkio_print_trace(struct blk_io_trace *trace)
 
 static void blkio_processor_handle_buffer(struct blkio_buffer *buf)
 {
-	struct blkio_tracer *tracer = buf->tracer;
-	struct blkio_buffer *prev = tracer->prev;
-	struct blk_io_trace trace;
-	char *data = (void *)&trace;
-
-	if (prev) {
-		const size_t prev_size = prev->size - prev->pos;
-		const size_t curr_size = buf->size;
-
-		if (prev_size + curr_size < sizeof(trace)) {
-			blkio_coalesce_buffers(prev, buf);
-			tracer->prev = buf;
-			blkio_free_buffer(prev);
-			return;
-		}
-
-		memcpy(data, prev->data + prev->pos, prev_size);
-		memcpy(data + prev_size, buf->data, sizeof(trace) - prev_size);
-		blkio_trace_to_cpu(&trace);
-
-		if (sizeof(trace) + trace.pdu_len > prev_size + curr_size) {
-			blkio_coalesce_buffers(prev, buf);
-			tracer->prev = buf;
-			blkio_free_buffer(prev);
-			return;
-		}
-
-		tracer->prev = 0;
-		blkio_free_buffer(prev);
-		buf->pos += sizeof(trace) + trace.pdu_len - prev_size;
-		blkio_print_trace(&trace);
-	}
-
-	while (1) {
-		if (buf->size - buf->pos < sizeof(trace))
-			break;
-
-		memcpy(data, buf->data + buf->pos, sizeof(trace));
-		blkio_trace_to_cpu(&trace);
-
-		if (sizeof(trace) + trace.pdu_len > buf->size - buf->pos)
-			break;
-
-		buf->pos += sizeof(trace) + trace.pdu_len;
-
-		blkio_print_trace(&trace);
-	}
-
-	if (buf->pos != buf->size)
-		tracer->prev = buf;
-	else
-		blkio_free_buffer(buf);
+	for (size_t i = 0; i != buf->count; ++i)
+		blkio_print_trace(buf->data + i);
+	blkio_free_buffer(buf);
 }
 
 static void blkio_processor_handle(struct blkio_processor *proc)
@@ -291,28 +220,69 @@ static void *blkio_processor_main(void *data)
 	return 0;
 }
 
-static int blkio_tracer_read(struct blkio_tracer *tracer)
+static void blkio_submit_traces(struct blkio_tracer *tracer,
+			struct blkio_buffer *traces)
 {
-	struct blkio_buffer *buffer = blkio_alloc_buffer(BLKIO_BUFFER_SIZE);
+	if (!traces)
+		return;
 
-	if (!buffer) {
-		fprintf(stderr, "blkio_buffer allocation failed\n");
-		return 1;
+	if (!traces->count) {
+		blkio_free_buffer(traces);
+		return;
 	}
 
-	buffer->size = read(tracer->fd, buffer->data, BLKIO_BUFFER_SIZE);
-	if (buffer->size <= 0) {
-		blkio_free_buffer(buffer);
-		return 1;
-	}
-
-	buffer->timestamp = blkio_timestamp();
-	buffer->tracer = tracer;
-
+	traces->timestamp = traces->data[0].time;
 	pthread_mutex_lock(&tracer->lock);
-	list_link_before(&tracer->bufs, &buffer->head);
+	list_link_before(&tracer->bufs, &traces->head);
 	pthread_mutex_unlock(&tracer->lock);
+}
 
+static int blkio_read_traces(struct blkio_tracer *tracer,
+			char *buffer, size_t *size)
+{
+	const size_t trace_size = sizeof(struct blk_io_trace);
+	const size_t max_count = BLKIO_BUFFER_SIZE / trace_size;
+
+	ssize_t rd = read(tracer->fd, buffer + *size, BLKIO_BUFFER_SIZE);
+	struct blkio_buffer *traces = 0;
+	size_t pos = 0;
+
+	while (rd > 0) {
+		*size += rd;
+
+		while (*size - pos >= trace_size) {
+			if (!traces)
+				traces = blkio_alloc_buffer(BLKIO_BUFFER_SIZE);
+
+			if (!traces)
+				return -1;
+
+			struct blk_io_trace *trace =
+						traces->data + traces->count;
+
+			memcpy(trace, buffer + pos, trace_size);
+			blkio_trace_to_cpu(trace);
+
+			const size_t skip = trace_size + trace->pdu_len;
+
+			if (skip > *size - pos)
+				break;
+
+			pos += skip;
+			if (++traces->count == max_count) {
+				blkio_submit_traces(tracer, traces);
+				traces = 0;
+			}
+		}
+
+		if (pos != *size)
+			memmove(buffer, buffer + pos, *size - pos);
+		*size -= pos;
+		pos = 0;
+		rd = read(tracer->fd, buffer + *size, BLKIO_BUFFER_SIZE);
+	}
+
+	blkio_submit_traces(tracer, traces);
 	return 0;
 }
 
@@ -320,6 +290,12 @@ static void *blkio_tracer_main(void *data)
 {
 	struct blkio_tracer *tracer = data;
 	struct pollfd pollfd;
+
+	char *buffer = malloc(3 * BLKIO_BUFFER_SIZE);
+	size_t size = 0;
+
+	if (!buffer)
+		return 0;
 
 	pthread_setaffinity_np(tracer->thread, sizeof(tracer->cpuset),
 			&tracer->cpuset);
@@ -329,7 +305,6 @@ static void *blkio_tracer_main(void *data)
 	pollfd.revents = 0;
 
 	blkio_tracer_wait(tracer);
-
 	while (tracer->state == TRACE_RUN) {
 		const int rc = poll(&pollfd, 1, 50);
 
@@ -341,11 +316,15 @@ static void *blkio_tracer_main(void *data)
 		if (!(pollfd.revents & POLLIN))
 			continue;
 
-		while (!blkio_tracer_read(tracer));
+		if (blkio_read_traces(tracer, buffer, &size)) {
+			// Everything is bad.. We are out of memory...
+			free(buffer);
+			return 0;
+		}
 	}
 
-	while (!blkio_tracer_read(tracer));
-
+	blkio_read_traces(tracer, buffer, &size);
+	free(buffer);
 	return 0;
 }
 

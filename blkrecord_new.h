@@ -13,9 +13,8 @@ struct blkio_buffer {
 	struct list_head head;
 	struct rb_node node;
 	unsigned long long timestamp;
-	struct blkio_tracer *tracer;
-	void *data;
-	size_t pos, size;
+	struct blk_io_trace *data;
+	size_t count;
 };
 
 enum blkio_tracer_state {
