@@ -1,5 +1,6 @@
 #include "blkrecord_new.h"
 #include "blktrace_api.h"
+#include "utils.h"
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
@@ -306,7 +307,7 @@ static void *blkio_tracer_main(void *data)
 
 	blkio_tracer_wait(tracer);
 	while (tracer->state == TRACE_RUN) {
-		const int rc = poll(&pollfd, 1, 50);
+		const int rc = poll(&pollfd, 1, 100);
 
 		if (rc < 0) {
 			perror("Poll failed: ");
@@ -595,6 +596,15 @@ static int blkio_get_drops(struct blkio_record_ctx *ctx)
 	return count;
 }
 
+
+static volatile sig_atomic_t done;
+
+static void finish_tracing(int sig)
+{
+	(void) sig;
+	done = 1;
+}
+
 static int trace_device(const char *block_device_name)
 {
 	struct blkio_record_ctx ctx;
@@ -603,7 +613,8 @@ static int trace_device(const char *block_device_name)
 		return -1;
 
 	blkio_trace_start(&ctx);
-	sleep(5);
+	while (!done)
+		pause();
 	blkio_trace_stop(&ctx);
 
 	printf("buffer dropped: %d\n", blkio_get_drops(&ctx));
@@ -613,6 +624,10 @@ static int trace_device(const char *block_device_name)
 
 int main()
 {
+	handle_signal(SIGINT, finish_tracing);
+	handle_signal(SIGHUP, finish_tracing);
+	handle_signal(SIGTERM, finish_tracing);
+
 	trace_device("/dev/nullb0");
 	return 0;
 }
