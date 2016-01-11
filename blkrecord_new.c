@@ -19,6 +19,21 @@
 #include <errno.h>
 
 
+static struct blkio_event_node *blkio_alloc_event(struct blkio_event *event)
+{
+	struct blkio_event_node *node = malloc(sizeof(*node));
+
+	if (!node)
+		return 0;
+
+	memset(&node->node, 0, sizeof(node->node));
+	node->event = *event;
+	return node;
+}
+
+static void blkio_free_event(struct blkio_event_node *event)
+{ free(event); }
+
 static struct blkio_buffer *blkio_alloc_buffer(size_t size)
 {
 	void *ptr = malloc(sizeof(struct blkio_buffer) + size);
@@ -77,29 +92,54 @@ static void blkio_processor_wait(struct blkio_processor *proc)
 	pthread_mutex_unlock(&proc->lock);
 }
 
-static void blkio_processor_insert_buffer(struct blkio_processor *proc,
-			struct blkio_buffer *buf)
+static void blkio_print_event(struct blkio_event *event)
 {
-	struct rb_node **plink = &proc->buffers.rb_node;
+	printf("time: %llu, sectors: %llu-%llu\n",
+		(unsigned long long) event->time,
+		(unsigned long long) event->from,
+		(unsigned long long) event->to);
+}
+
+static void blkio_event_insert(struct blkio_processor *proc,
+			struct blkio_event_node *event)
+{
+	struct rb_node **plink = &proc->events.rb_node;
 	struct rb_node *parent = 0;
 
 	while (*plink) {
-		struct blkio_buffer *b = rb_entry(*plink, struct blkio_buffer,
-					node);
+		struct blkio_event_node *e = rb_entry(*plink,
+					struct blkio_event_node, node);
 
 		parent = *plink;
-
-		if (b->timestamp <= buf->timestamp)
+		if (e->event.time < event->event.time)
 			plink = &parent->rb_right;
 		else
 			plink = &parent->rb_left;
 	}
 
-	rb_link_node(&buf->node, parent, plink);
-	rb_insert_color(&buf->node, &proc->buffers);
+	rb_link_node(&event->node, parent, plink);
+	rb_insert_color(&event->node, &proc->events);
 }
 
-static void blkio_processor_populate_list(struct blkio_processor *proc,
+static void blkio_processor_populate_buffer(struct blkio_processor *proc,
+			struct blkio_buffer *buf)
+{
+	(void) proc;
+
+	for (size_t i = 0; i != buf->count; ++i) {
+		struct blkio_event_node *event =
+					blkio_alloc_event(buf->data + i);
+
+		if (!event) {
+			fprintf(stderr, "Run out of memory");
+			return;
+		}
+
+		blkio_event_insert(proc, event);		
+	}
+}
+
+static void blkio_processor_populate_buffers(struct blkio_processor *proc,
 			struct list_head *head)
 {
 	struct list_head *ptr = head->next;
@@ -109,7 +149,9 @@ static void blkio_processor_populate_list(struct blkio_processor *proc,
 					head);
 
 		ptr = ptr->next;
-		blkio_processor_insert_buffer(proc, buf);
+		list_unlink(&buf->head);
+		blkio_processor_populate_buffer(proc, buf);
+		blkio_free_buffer(buf);
 	}
 }
 
@@ -119,37 +161,91 @@ static void blkio_processor_populate(struct blkio_processor *proc)
 	struct list_head *head = &ctx->tracers;
 	struct list_head *ptr = head->next;
 
+	struct list_head buffers;
+
+	list_head_init(&buffers);
 	while (ptr != head) {
 		struct blkio_tracer *tracer = list_entry(ptr,
 					struct blkio_tracer, link);
 
 		ptr = ptr->next;
 
-		struct list_head buffers;
-
-		list_head_init(&buffers);
-
 		pthread_mutex_lock(&tracer->lock);
-		list_splice(&buffers, &tracer->bufs);
+		list_splice_tail(&buffers, &tracer->bufs);
 		pthread_mutex_unlock(&tracer->lock);
+	}
+	blkio_processor_populate_buffers(proc, &buffers);
+}
 
-		blkio_processor_populate_list(proc, &buffers);
+static void blkio_processor_handle_event(struct blkio_processor *proc,
+			struct blkio_event_node *event)
+{
+	(void) proc;
+
+	blkio_print_event(&event->event);
+}
+
+static void __blkio_processor_handle(struct blkio_processor *proc,
+			struct blkio_event_node *first, unsigned long long end)
+{
+	while (first && first->event.time <= end) {
+		struct rb_node *next = rb_next(&first->node);
+
+		blkio_processor_handle_event(proc, first);
+		rb_erase(&first->node, &proc->events);
+		blkio_free_event(first);
+
+		first = 0;
+		if (next)
+			first = rb_entry(next, struct blkio_event_node, node);
 	}
 }
 
-static struct blkio_buffer *blkio_processor_peek(struct blkio_processor *proc)
+static int blkio_processor_handle(struct blkio_processor *proc, int force)
 {
-	struct rb_node *first = rb_first(&proc->buffers);
+	/*
+	 * poll_timeout specified with millisecond resolution, while
+	 * timestamps use nanosecod resolution
+	 */
+	const unsigned long long poll_timeout =
+				1000000ull * proc->ctx->conf->poll_timeout;
+	const unsigned long long min_span = 2 * poll_timeout;
 
-	if (!first)
+	struct rb_node *f = rb_first(&proc->events);
+
+	if (!f)
 		return 0;
 
-	return rb_entry(first, struct blkio_buffer, node);
+	struct blkio_event_node *first = rb_entry(f, struct blkio_event_node,
+				node);
+	struct blkio_event_node *last = rb_entry(rb_last(&proc->events),
+				struct blkio_event_node, node);
+
+	if (!force && last->event.time - first->event.time < min_span)
+		return 0;
+
+	__blkio_processor_handle(proc, first,
+			force ? ~0ull : first->event.time + poll_timeout);
+	return 1;
 }
 
-static void blkio_processor_unlink(struct blkio_processor *proc,
-			struct blkio_buffer *buf)
-{ rb_erase(&buf->node, &proc->buffers); }
+static void *blkio_processor_main(void *data)
+{
+	struct blkio_processor *proc = data;
+
+	blkio_processor_wait(proc);
+
+	while (proc->state == TRACE_RUN) {
+		blkio_processor_populate(proc);
+		while (blkio_processor_handle(proc, 0));
+		pthread_yield();
+	}
+
+	blkio_processor_populate(proc);
+	blkio_processor_handle(proc, 1);
+
+	return 0;
+}
 
 static int blkio_trace_to_cpu(struct blk_io_trace *trace)
 {
@@ -170,52 +266,46 @@ static int blkio_trace_to_cpu(struct blk_io_trace *trace)
 	return 0;
 }
 
-static void blkio_print_trace(struct blk_io_trace *trace)
+static int blkio_queue_event(struct blk_io_trace *trace)
 {
-	printf("time: %llu, sector: %llu, bytes: %lu, pid: %lu, cpu: %lu\n",
-		(unsigned long long) trace->time,
-		(unsigned long long) trace->sector,
-		(unsigned long) trace->bytes,
-		(unsigned long) trace->pid,
-		(unsigned long) trace->cpu);
+	return ((trace->action & BLK_TC_ACT(BLK_TC_QUEUE)) &&
+		((trace->action & 0xFFFFu) == __BLK_TA_QUEUE));
 }
 
-static void blkio_processor_handle_buffer(struct blkio_buffer *buf)
+static int blkio_complete_event(struct blk_io_trace *trace)
 {
-	for (size_t i = 0; i != buf->count; ++i)
-		blkio_print_trace(buf->data + i);
-	blkio_free_buffer(buf);
+	return ((trace->action & BLK_TC_ACT(BLK_TC_COMPLETE)) &&
+		((trace->action & 0xFFFFu) == __BLK_TA_COMPLETE));
 }
 
-static void blkio_processor_handle(struct blkio_processor *proc)
+static int blkio_write_event(struct blk_io_trace *trace)
 {
-	struct blkio_buffer *buf = blkio_processor_peek(proc);
-
-	while (buf) {
-		struct rb_node *next = rb_next(&buf->node);
-
-		blkio_processor_unlink(proc, buf);
-		blkio_processor_handle_buffer(buf);
-		buf = next ? (rb_entry(next, struct blkio_buffer, node)) : 0;
-	}
+	return (trace->action & BLK_TC_ACT(BLK_TC_WRITE)) != 0;
 }
 
-static void *blkio_processor_main(void *data)
+static int blkio_sync_event(struct blk_io_trace *trace)
 {
-	struct blkio_processor *proc = data;
+	return (trace->action & BLK_TC_ACT(BLK_TC_SYNC)) != 0;
+}
 
-	blkio_processor_wait(proc);
+static int blkio_fua_event(struct blk_io_trace *trace)
+{
+	return (trace->action & BLK_TC_ACT(BLK_TC_FUA)) != 0;
+}
 
-	while (proc->state == TRACE_RUN) {
-		blkio_processor_populate(proc);
-		blkio_processor_handle(proc);
-		pthread_yield();
-	}
+static unsigned blkio_trace_type(struct blk_io_trace *trace)
+{
+	unsigned type = 0;
 
-	blkio_processor_populate(proc);
-	blkio_processor_handle(proc);
-
-	return 0;
+	if (blkio_queue_event(trace))
+		type |= QUEUE_MASK;
+	if (blkio_write_event(trace))
+		type |= WRITE_MASK;
+	if (blkio_sync_event(trace))
+		type |= SYNC_MASK;
+	if (blkio_fua_event(trace))
+		type |= FUA_MASK;
+	return type;
 }
 
 static void blkio_submit_traces(struct blkio_tracer *tracer,
@@ -240,23 +330,18 @@ static int blkio_accept_trace(struct blk_io_trace *trace)
 	if (!trace->bytes)
 		return 0;
 
-	if ((trace->action & BLK_TC_ACT(BLK_TC_QUEUE)) &&
-	    (trace->action & 0xFFFFu) == __BLK_TA_QUEUE)
-		return 1;
-
-	if ((trace->action & BLK_TC_ACT(BLK_TC_COMPLETE)) &&
-	    (trace->action & 0xFFFFu) == __BLK_TA_COMPLETE)
-		return 1;
-
-	return 0;
+	return blkio_queue_event(trace) || blkio_complete_event(trace);
 }
 
 static int blkio_read_traces(struct blkio_tracer *tracer,
 			char *buffer, size_t *size)
 {
 	const size_t trace_size = sizeof(struct blk_io_trace);
+	const size_t event_size = sizeof(struct blkio_event);
 	const size_t buffer_size = tracer->ctx->conf->buffer_size;
-	const size_t max_count = buffer_size / trace_size;
+	const size_t max_count = buffer_size / event_size;
+
+	struct blk_io_trace trace;
 
 	ssize_t rd = read(tracer->fd, buffer + *size, buffer_size);
 	struct blkio_buffer *traces = 0;
@@ -272,23 +357,30 @@ static int blkio_read_traces(struct blkio_tracer *tracer,
 			if (!traces)
 				return -1;
 
-			struct blk_io_trace *trace =
-						traces->data + traces->count;
+			memcpy(&trace, buffer + pos, trace_size);
 
-			memcpy(trace, buffer + pos, trace_size);
-
-			if (blkio_trace_to_cpu(trace))
+			if (blkio_trace_to_cpu(&trace))
 				return -1;
 
-			const size_t skip = trace_size + trace->pdu_len;
+			const size_t skip = trace_size + trace.pdu_len;
 
 			if (skip > *size - pos)
 				break;
 
 			pos += skip;
 
-			if (!blkio_accept_trace(trace))
+			if (!blkio_accept_trace(&trace))
 				continue;
+
+			struct blkio_event *event =
+						traces->data + traces->count;
+
+			event->time = trace.time;
+			event->from = trace.sector;
+			event->to = trace.sector + MAX(1, trace.bytes / 512);
+			event->type = blkio_trace_type(&trace);
+			event->cpu = 0;
+			event->pid = 0;
 
 			if (++traces->count == max_count) {
 				blkio_submit_traces(tracer, traces);
@@ -328,7 +420,7 @@ static void *blkio_tracer_main(void *data)
 
 	blkio_tracer_wait(tracer);
 	while (tracer->state == TRACE_RUN) {
-		const int rc = poll(&pollfd, 1, 100);
+		const int rc = poll(&pollfd, 1, ctx->conf->poll_timeout);
 
 		if (rc < 0) {
 			perror("Poll failed: ");
@@ -509,6 +601,7 @@ static int blkio_create_processor(struct blkio_record_ctx *ctx)
 {
 	assert(!pthread_mutex_init(&ctx->processor.lock, NULL));
 	assert(!pthread_cond_init(&ctx->processor.cond, NULL));
+	memset(&ctx->processor.events, 0, sizeof(ctx->processor.events));
 	ctx->processor.state = TRACE_WAIT;
 	ctx->processor.ctx = ctx;
 	return blkio_start_processor(&ctx->processor);
@@ -655,7 +748,8 @@ int main()
 		"/sys/kernel/debug",
 		"/dev/nullb0",
 		512 * 1024,
-		4
+		4,
+		1000
 	};
 
 	handle_signal(SIGINT, finish_tracing);

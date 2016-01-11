@@ -4,17 +4,20 @@
 #include <pthread.h>
 
 #include "blktrace_api.h"
+#include "account.h"
 #include "rbtree.h"
 #include "list.h"
 
-struct blkio_tracer;
-
 struct blkio_buffer {
 	struct list_head head;
-	struct rb_node node;
 	unsigned long long timestamp;
-	struct blk_io_trace *data;
+	struct blkio_event *data;
 	size_t count;
+};
+
+struct blkio_event_node {
+	struct rb_node node;
+	struct blkio_event event;
 };
 
 enum blkio_tracer_state {
@@ -39,7 +42,7 @@ struct blkio_record_ctx;
 
 struct blkio_processor {
 	struct blkio_record_ctx *ctx;
-	struct rb_root buffers;
+	struct rb_root events;
 	pthread_t thread;	
 	pthread_mutex_t lock;
 	pthread_cond_t cond;
@@ -51,6 +54,7 @@ struct blkio_record_conf {
 	const char *device;
 	size_t buffer_size;
 	size_t buffer_count;
+	int poll_timeout;
 };
 
 struct blkio_record_ctx {
