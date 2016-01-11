@@ -43,6 +43,10 @@ struct blkio_record_ctx;
 struct blkio_processor {
 	struct blkio_record_ctx *ctx;
 	struct rb_root events;
+	struct rb_root reads;
+	struct rb_root writes;
+	struct blkio_event *data;
+	size_t count, size;
 	pthread_t thread;	
 	pthread_mutex_t lock;
 	pthread_cond_t cond;

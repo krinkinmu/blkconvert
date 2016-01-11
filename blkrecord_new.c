@@ -69,6 +69,21 @@ static struct blkio_tracer *blkio_alloc_tracer(void)
 	return tracer;
 }
 
+static void __blkio_release_events(struct rb_node *node)
+{
+	while (node) {
+		struct blkio_event_node *event = rb_entry(node,
+					struct blkio_event_node, node);
+
+		__blkio_release_events(node->rb_right);
+		node = node->rb_left;
+		blkio_free_event(event);
+	}
+}
+
+static void blkio_release_events(struct rb_root *events)
+{ __blkio_release_events(events->rb_node); }
+
 static void blkio_free_tracer(struct blkio_tracer *tracer)
 {
 	assert(!pthread_mutex_destroy(&tracer->lock));
@@ -90,14 +105,6 @@ static void blkio_processor_wait(struct blkio_processor *proc)
 	while (proc->state == TRACE_WAIT)
 		pthread_cond_wait(&proc->cond, &proc->lock);
 	pthread_mutex_unlock(&proc->lock);
-}
-
-static void blkio_print_event(struct blkio_event *event)
-{
-	printf("time: %llu, sectors: %llu-%llu\n",
-		(unsigned long long) event->time,
-		(unsigned long long) event->from,
-		(unsigned long long) event->to);
 }
 
 static void blkio_event_insert(struct blkio_processor *proc,
@@ -177,12 +184,150 @@ static void blkio_processor_populate(struct blkio_processor *proc)
 	blkio_processor_populate_buffers(proc, &buffers);
 }
 
+static int blkio_events_intersect(struct blkio_event_node *l,
+			struct blkio_event_node *r)
+{
+	if (l->event.to <= r->event.from || l->event.from >= r->event.to)
+		return 0;
+	return 1;
+}
+
+static void blkio_processor_print_stats(struct blkio_stats *stats)
+{
+	printf("%llu-%llu: %lu reads, %lu writes\n",
+		(unsigned long long) stats->begin_time,
+		(unsigned long long) stats->end_time,
+		(unsigned long) stats->reads,
+		(unsigned long) stats->writes);
+}
+
+static void blkio_processor_account_events(struct blkio_processor *proc)
+{
+	struct blkio_stats stats;
+		
+	memset(&stats, 0, sizeof(stats));
+	if (!account_events(proc->data, proc->count, &stats))
+		blkio_processor_print_stats(&stats);
+	proc->count = 0;
+}
+
+static void blkio_processor_append_event(struct blkio_processor *proc,
+			struct blkio_event_node *event)
+{
+	proc->data[proc->count++] = event->event;
+
+	if (proc->count == proc->size)
+		blkio_processor_account_events(proc);
+}
+
+static int blkio_processor_insert_queue(struct blkio_event_node *event,
+			struct rb_root *root)
+{
+	struct rb_node **plink = &root->rb_node;
+	struct rb_node *parent = 0;
+
+	while (*plink) {
+		struct blkio_event_node *e = rb_entry(*plink,
+					struct blkio_event_node, node);
+
+		if (blkio_events_intersect(event, e))
+			return -1;
+
+		parent = *plink;
+		if (e->event.from < event->event.from)
+			plink = &parent->rb_right;
+		else
+			plink = &parent->rb_left;
+	}
+
+	rb_link_node(&event->node, parent, plink);
+	rb_insert_color(&event->node, root);
+	return 0;
+}
+
+static void blkio_processor_handle_queue(struct blkio_processor *proc,
+			struct blkio_event_node *event, struct rb_root *root)
+{
+	if (!blkio_processor_insert_queue(event, root))
+		blkio_processor_append_event(proc, event);
+	else
+		blkio_free_event(event);
+}
+
+static void blkio_processor_handle_complete(struct blkio_processor *proc,
+			struct blkio_event_node *event, struct rb_root *root)
+{
+	struct blkio_event_node *first = 0;
+	struct rb_node *ptr = root->rb_node;
+
+	while (ptr) {
+		struct blkio_event_node *e = rb_entry(ptr,
+					struct blkio_event_node, node);
+
+		if (e->event.to <= event->event.from) {
+			ptr = ptr->rb_right;
+		} else {
+			ptr = ptr->rb_left;
+			first = e;
+		}
+	}
+
+	while (first && blkio_events_intersect(first, event)) {
+		struct rb_node *next = rb_next(&first->node);
+		struct blkio_event_node tmp = *event;
+
+		tmp.event.cpu = first->event.cpu;
+		tmp.event.pid = first->event.pid;
+
+		if (first->event.from >= event->event.from) {
+			tmp.event.from = first->event.from;
+
+			if (first->event.to <= event->event.to) {
+				tmp.event.to = first->event.to;
+
+				rb_erase(&first->node, root);
+				blkio_free_event(first);
+			} else {
+				first->event.from = event->event.to;
+			}
+		} else {
+			if (first->event.to <= event->event.to) {
+				tmp.event.to = first->event.to;
+				first->event.to = event->event.from;
+			} else {
+				struct blkio_event_node *new =
+					blkio_alloc_event(&first->event);
+
+				first->event.to = event->event.from;
+				if (new) {
+					new->event.from = event->event.to;
+					blkio_processor_insert_queue(new, root);
+				} else {
+					fprintf(stderr, "Ran out of memory\n");
+				}
+			}
+		}
+
+		blkio_processor_append_event(proc, &tmp);
+		first = 0;
+		if (next)
+			first = rb_entry(next, struct blkio_event_node, node);
+	}
+	blkio_free_event(event);
+}
+
 static void blkio_processor_handle_event(struct blkio_processor *proc,
 			struct blkio_event_node *event)
 {
-	(void) proc;
+	const int write = IS_WRITE(event->event.type);
+	const int queue = IS_QUEUE(event->event.type);
 
-	blkio_print_event(&event->event);
+	struct rb_root *root = write ? &proc->writes : &proc->reads;
+
+	if (queue)
+		blkio_processor_handle_queue(proc, event, root);
+	else
+		blkio_processor_handle_complete(proc, event, root);
 }
 
 static void __blkio_processor_handle(struct blkio_processor *proc,
@@ -191,9 +336,8 @@ static void __blkio_processor_handle(struct blkio_processor *proc,
 	while (first && first->event.time <= end) {
 		struct rb_node *next = rb_next(&first->node);
 
-		blkio_processor_handle_event(proc, first);
 		rb_erase(&first->node, &proc->events);
-		blkio_free_event(first);
+		blkio_processor_handle_event(proc, first);
 
 		first = 0;
 		if (next)
@@ -232,6 +376,13 @@ static int blkio_processor_handle(struct blkio_processor *proc, int force)
 static void *blkio_processor_main(void *data)
 {
 	struct blkio_processor *proc = data;
+	struct blkio_record_ctx *ctx = proc->ctx;
+
+	proc->size = ctx->conf->buffer_size / sizeof(struct blkio_event);
+	proc->data = calloc(proc->size, sizeof(struct blkio_event));
+
+	if (!proc->data)
+		return 0;
 
 	blkio_processor_wait(proc);
 
@@ -244,6 +395,11 @@ static void *blkio_processor_main(void *data)
 	blkio_processor_populate(proc);
 	blkio_processor_handle(proc, 1);
 
+	blkio_release_events(&proc->events);
+	blkio_release_events(&proc->reads);
+	blkio_release_events(&proc->writes);
+
+	free(proc->data);
 	return 0;
 }
 
@@ -602,8 +758,13 @@ static int blkio_create_processor(struct blkio_record_ctx *ctx)
 	assert(!pthread_mutex_init(&ctx->processor.lock, NULL));
 	assert(!pthread_cond_init(&ctx->processor.cond, NULL));
 	memset(&ctx->processor.events, 0, sizeof(ctx->processor.events));
+	memset(&ctx->processor.writes, 0, sizeof(ctx->processor.writes));
+	memset(&ctx->processor.reads, 0, sizeof(ctx->processor.reads));
 	ctx->processor.state = TRACE_WAIT;
 	ctx->processor.ctx = ctx;
+	ctx->processor.data = 0;
+	ctx->processor.count = 0;
+	ctx->processor.size = 0;
 	return blkio_start_processor(&ctx->processor);
 }
 

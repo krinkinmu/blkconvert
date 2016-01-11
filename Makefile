@@ -15,7 +15,7 @@ BLKRECORD_SRC := blkrecord.c blkqueue.c account.c
 BLKRECORD_DEP := $(BLKRECORD_SRC:.c=.d)
 BLKRECORD_OBJ := $(BLKRECORD_SRC:.c=.o)
 
-BLKRECORD_NEW_SRC := blkrecord_new.c
+BLKRECORD_NEW_SRC := blkrecord_new.c account.c
 BLKRECORD_NEW_DEP := $(BLKRECORD_NEW_SRC:.c=.d)
 BLKRECORD_NEW_OBJ := $(BLKRECORD_NEW_SRC:.c=.o)
 
