@@ -1,5 +1,6 @@
 #include "blkrecord_new.h"
 #include "blktrace_api.h"
+#include "file_io.h"
 #include "utils.h"
 
 #include <sys/types.h>
@@ -10,6 +11,7 @@
 #include <fcntl.h>
 #include <poll.h>
 
+#include <getopt.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -192,7 +194,7 @@ static int blkio_events_intersect(struct blkio_event_node *l,
 	return 1;
 }
 
-static void blkio_processor_print_stats(struct blkio_stats *stats)
+static void blkio_print_stats(struct blkio_stats *stats)
 {
 	printf("%llu-%llu: %lu reads, %lu writes\n",
 		(unsigned long long) stats->begin_time,
@@ -207,8 +209,7 @@ static void blkio_processor_account_events(struct blkio_processor *proc)
 		
 	memset(&stats, 0, sizeof(stats));
 	if (!account_events(proc->data, proc->count, &stats))
-		blkio_processor_print_stats(&stats);
-	proc->count = 0;
+		blkio_print_stats(&stats);
 }
 
 static void blkio_processor_append_event(struct blkio_processor *proc,
@@ -216,8 +217,10 @@ static void blkio_processor_append_event(struct blkio_processor *proc,
 {
 	proc->data[proc->count++] = event->event;
 
-	if (proc->count == proc->size)
+	if (proc->count == proc->size) {
 		blkio_processor_account_events(proc);
+		proc->count = 0;
+	}
 }
 
 static int blkio_processor_insert_queue(struct blkio_event_node *event,
@@ -377,9 +380,10 @@ static void *blkio_processor_main(void *data)
 {
 	struct blkio_processor *proc = data;
 	struct blkio_record_ctx *ctx = proc->ctx;
+	struct blkio_record_conf *conf = ctx->conf;
 
-	proc->size = ctx->conf->buffer_size / sizeof(struct blkio_event);
-	proc->data = calloc(proc->size, sizeof(struct blkio_event));
+	proc->data = calloc(conf->events_count, sizeof(struct blkio_event));
+	proc->size = conf->events_count;
 
 	if (!proc->data)
 		return 0;
@@ -579,7 +583,7 @@ static void *blkio_tracer_main(void *data)
 		const int rc = poll(&pollfd, 1, ctx->conf->poll_timeout);
 
 		if (rc < 0) {
-			perror("Poll failed: ");
+			perror("Poll failed");
 			continue;
 		}
 
@@ -620,7 +624,7 @@ static int blkio_start_tracer(struct blkio_record_ctx *ctx,
 	tracer->ctx = ctx;
 	tracer->fd = blkio_trace_open_cpu(ctx, cpu);
 	if (tracer->fd < 0) {
-		perror("Cannot open trace file: ");
+		perror("Cannot open trace file");
 		return -1;
 	}
 
@@ -768,7 +772,7 @@ static int blkio_create_processor(struct blkio_record_ctx *ctx)
 	return blkio_start_processor(&ctx->processor);
 }
 
-static int blkio_trace_start(struct blkio_record_ctx *ctx)
+int blkio_trace_start(struct blkio_record_ctx *ctx)
 {
 	if (ioctl(ctx->fd, BLKTRACESTART))
 		return -1;
@@ -777,7 +781,7 @@ static int blkio_trace_start(struct blkio_record_ctx *ctx)
 	return 0;
 }
 
-static void blkio_trace_stop(struct blkio_record_ctx *ctx)
+void blkio_trace_stop(struct blkio_record_ctx *ctx)
 {
 	ioctl(ctx->fd, BLKTRACESTOP);
 	blkio_stop_tracers(ctx);
@@ -786,7 +790,7 @@ static void blkio_trace_stop(struct blkio_record_ctx *ctx)
 	blkio_wait_processor(ctx);
 }
 
-static void blkio_record_ctx_release(struct blkio_record_ctx *ctx)
+void blkio_record_ctx_release(struct blkio_record_ctx *ctx)
 {
 	blkio_destroy_tracers(ctx);
 	blkio_destroy_processor(ctx);
@@ -797,7 +801,7 @@ static void blkio_record_ctx_release(struct blkio_record_ctx *ctx)
 	}
 }
 
-static int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
+int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
 			struct blkio_record_conf *conf)
 {
 	memset(ctx, 0, sizeof(*ctx));
@@ -813,20 +817,20 @@ static int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
 
 	ctx->cpus = sysconf(_SC_NPROCESSORS_CONF);
 	if (ctx->cpus < 0) {
-		perror("Cannot get number of cpu: ");
+		perror("Cannot get number of cpu");
 		blkio_record_ctx_release(ctx);
 		return -1;
 	}
 
 	ctx->fd = open(conf->device, O_RDONLY | O_NONBLOCK);
 	if (ctx->fd < 0) {
-		perror("Cannot open block device: ");
+		perror("Cannot open block device");
 		blkio_record_ctx_release(ctx);
 		return -1;
 	}
 
 	if (ioctl(ctx->fd, BLKTRACESETUP, &ctx->trace_setup) < 0) {
-		perror("BLKTRACESETUP failed: ");
+		perror("BLKTRACESETUP failed");
 		blkio_record_ctx_release(ctx);
 		return -1;
 	}
@@ -846,7 +850,7 @@ static int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
 	return 0;
 }
 
-static int blkio_get_drops(struct blkio_record_ctx *ctx)
+int blkio_trace_drops(struct blkio_record_ctx *ctx)
 {
 	char filename[PATH_MAX + 64];
 
@@ -860,7 +864,7 @@ static int blkio_get_drops(struct blkio_record_ctx *ctx)
 	int fd = open(filename, O_RDONLY);
 
 	if (fd < 0) {
-		perror("Cannot open drop counter: ");
+		perror("Cannot open drop counter");
 		return 0;
 	}
 
@@ -869,7 +873,7 @@ static int blkio_get_drops(struct blkio_record_ctx *ctx)
 
 	memset(tmp, 0, sizeof(tmp));
 	if (read(fd, tmp, sizeof(tmp) - 1) < 0)
-		perror("Failed to read drop counter: ");
+		perror("Failed to read drop counter");
 	else
 		count = atoi(tmp);
 
@@ -877,46 +881,18 @@ static int blkio_get_drops(struct blkio_record_ctx *ctx)
 	return count;
 }
 
-
-static volatile sig_atomic_t done;
-
-static void finish_tracing(int sig)
+int blkio_net_read(int fd, void *data)
 {
-	(void) sig;
-	done = 1;
-}
+	struct blkio_net_hdr *hdr = data;
+	char *buffer = data;
 
-static int trace_device(struct blkio_record_conf *conf)
-{
-	struct blkio_record_ctx ctx;
-
-	if (blkio_record_ctx_setup(&ctx, conf))
+	if (myread(fd, hdr, sizeof(*hdr)))
 		return -1;
 
-	blkio_trace_start(&ctx);
-	while (!done)
-		pause();
-	blkio_trace_stop(&ctx);
+	const size_t size = le32toh(hdr->size);
 
-	fprintf(stderr, "buffers dropped: %d\n", blkio_get_drops(&ctx));
-	blkio_record_ctx_release(&ctx);
-	return 0;
-}
+	if (myread(fd, buffer + sizeof(*hdr), size - sizeof(*hdr)))
+		return -1;
 
-int main()
-{
-	struct blkio_record_conf conf = {
-		"/sys/kernel/debug",
-		"/dev/nullb0",
-		512 * 1024,
-		4,
-		1000
-	};
-
-	handle_signal(SIGINT, finish_tracing);
-	handle_signal(SIGHUP, finish_tracing);
-	handle_signal(SIGTERM, finish_tracing);
-
-	trace_device(&conf);
 	return 0;
 }
