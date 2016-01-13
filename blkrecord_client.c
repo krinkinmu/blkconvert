@@ -21,6 +21,22 @@ static void blkio_print_stats(struct blkio_stats *stats)
 		(unsigned long) stats->writes);
 }
 
+static int blkio_net_read(int fd, void *data)
+{
+	struct blkio_net_hdr *hdr = data;
+	char *buffer = data;
+
+	if (myread(fd, hdr, sizeof(*hdr)))
+		return -1;
+
+	const size_t size = le32toh(hdr->size);
+
+	if (myread(fd, buffer + sizeof(*hdr), size - sizeof(*hdr)))
+		return -1;
+
+	return 0;
+}
+
 static volatile sig_atomic_t done;
 
 static void finish_tracing(int sig)

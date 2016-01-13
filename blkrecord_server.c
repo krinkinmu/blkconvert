@@ -22,6 +22,21 @@ static void finish_tracing(int sig)
 	done = 1;
 }
 
+static int blkio_net_read(int fd, void *data)
+{
+	struct blkio_net_hdr *hdr = data;
+	char *buffer = data;
+
+	if (myread(fd, hdr, sizeof(*hdr)))
+		return -1;
+
+	const size_t size = le32toh(hdr->size);
+
+	if (myread(fd, buffer + sizeof(*hdr), size - sizeof(*hdr)))
+		return -1;
+	return 0;
+}
+
 static void blkio_net_status(int fd, int error, int drops)
 {
 	struct blkio_net_status status;

@@ -4,7 +4,7 @@ LDFLAGS ?=
 
 BLKPLAY_LDFLAGS          := $(LDFLAGS) -laio -lz
 BLKRECORD_LDFLAGS        := $(LDFLAGS) -lz
-BLKRECORD_CLIENT_LDFLAGS := $(LDFLAGS) -pthread
+BLKRECORD_CLIENT_LDFLAGS := $(LDFLAGS)
 BLKRECORD_SERVER_LDFLAGS := $(LDFLAGS) -pthread
 
 COMMON_SRC := algorithm.c object_cache.c file_io.c ctree.c list.c rbtree.c \
@@ -16,11 +16,11 @@ BLKRECORD_SRC := blkrecord.c blkqueue.c account.c
 BLKRECORD_DEP := $(BLKRECORD_SRC:.c=.d)
 BLKRECORD_OBJ := $(BLKRECORD_SRC:.c=.o)
 
-BLKRECORD_CLIENT_SRC := blkrecord_client.c blkrecord_common.c account.c
+BLKRECORD_CLIENT_SRC := blkrecord_client.c
 BLKRECORD_CLIENT_DEP := $(BLKRECORD_CLIENT_SRC:.c=.d)
 BLKRECORD_CLIENT_OBJ := $(BLKRECORD_CLIENT_SRC:.c=.o)
 
-BLKRECORD_SERVER_SRC := blkrecord_server.c blkrecord_common.c account.c
+BLKRECORD_SERVER_SRC := blkrecord_server.c trace.c account.c
 BLKRECORD_SERVER_DEP := $(BLKRECORD_SERVER_SRC:.c=.d)
 BLKRECORD_SERVER_OBJ := $(BLKRECORD_SERVER_SRC:.c=.o)
 

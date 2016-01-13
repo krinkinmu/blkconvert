@@ -127,6 +127,4 @@ union blkio_net_storage {
 	struct blkio_net_status status;
 };
 
-int blkio_net_read(int fd, void *buffer);
-
 #endif /*__BLKRECORD_H__*/
