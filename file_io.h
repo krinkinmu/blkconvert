@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 
-int myread(int fd, char *buf, size_t size);
-int mywrite(int fd, const char *buf, size_t size);
+int myread(int fd, void *buf, size_t size);
+int mywrite(int fd, const void *buf, size_t size);
 
 #endif /*__FILE_IO_H__*/
