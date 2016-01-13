@@ -1,7 +1,6 @@
 #include "blkrecord_new.h"
 #include "blktrace_api.h"
 #include "file_io.h"
-#include "utils.h"
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
@@ -11,7 +10,6 @@
 #include <fcntl.h>
 #include <poll.h>
 
-#include <getopt.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -879,20 +877,4 @@ int blkio_trace_drops(struct blkio_record_ctx *ctx)
 
 	close(fd);
 	return count;
-}
-
-int blkio_net_read(int fd, void *data)
-{
-	struct blkio_net_hdr *hdr = data;
-	char *buffer = data;
-
-	if (myread(fd, hdr, sizeof(*hdr)))
-		return -1;
-
-	const size_t size = le32toh(hdr->size);
-
-	if (myread(fd, buffer + sizeof(*hdr), size - sizeof(*hdr)))
-		return -1;
-
-	return 0;
 }
