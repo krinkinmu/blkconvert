@@ -8,7 +8,8 @@
 #include <stdio.h>
 #include <errno.h>
 
-#include "blkrecord_new.h"
+#include "trace_net.h"
+#include "trace.h"
 #include "network.h"
 #include "file_io.h"
 #include "utils.h"

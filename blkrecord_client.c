@@ -1,4 +1,4 @@
-#include "blkrecord_new.h"
+#include "trace_net.h"
 #include "network.h"
 #include "file_io.h"
 #include "utils.h"
@@ -10,6 +10,7 @@
 #include <fcntl.h>
 
 #include <getopt.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
 #include <stdio.h>

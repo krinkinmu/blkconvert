@@ -1,6 +1,6 @@
-#include "blkrecord_new.h"
 #include "blktrace_api.h"
 #include "file_io.h"
+#include "trace.h"
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
