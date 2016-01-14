@@ -192,22 +192,17 @@ static int blkio_events_intersect(struct blkio_event_node *l,
 	return 1;
 }
 
-static void blkio_print_stats(struct blkio_stats *stats)
-{
-	printf("%llu-%llu: %lu reads, %lu writes\n",
-		(unsigned long long) stats->begin_time,
-		(unsigned long long) stats->end_time,
-		(unsigned long) stats->reads,
-		(unsigned long) stats->writes);
-}
-
 static void blkio_processor_account_events(struct blkio_processor *proc)
 {
 	struct blkio_stats stats;
 		
 	memset(&stats, 0, sizeof(stats));
-	if (!account_events(proc->data, proc->count, &stats))
-		blkio_print_stats(&stats);
+	if (!account_events(proc->data, proc->count, &stats)) {
+		struct blkio_record_ctx *ctx = proc->ctx;
+		struct blkio_stats_handler *handler = ctx->handler;
+
+		handler->handle(handler, &stats);
+	}
 }
 
 static void blkio_processor_append_event(struct blkio_processor *proc,
@@ -800,6 +795,7 @@ void blkio_record_ctx_release(struct blkio_record_ctx *ctx)
 }
 
 int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
+			struct blkio_stats_handler *handler,
 			struct blkio_record_conf *conf)
 {
 	memset(ctx, 0, sizeof(*ctx));
@@ -809,6 +805,7 @@ int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
 	ctx->trace_setup.buf_size = conf->buffer_size;
 	ctx->trace_setup.buf_nr = conf->buffer_count;
 
+	ctx->handler = handler;
 	ctx->conf = conf;
 	ctx->cpus = -1;
 	ctx->fd = -1;

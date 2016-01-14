@@ -62,16 +62,22 @@ struct blkio_record_conf {
 	int poll_timeout;
 };
 
+struct blkio_stats_handler {
+	void (*handle)(struct blkio_stats_handler *, struct blkio_stats *);
+};
+
 struct blkio_record_ctx {
 	struct blk_user_trace_setup trace_setup;
 	struct blkio_processor processor;
 	struct list_head tracers;
+	struct blkio_stats_handler *handler;
 	struct blkio_record_conf *conf;
 	int cpus;
 	int fd;
 };
 
 int blkio_record_ctx_setup(struct blkio_record_ctx *ctx,
+			struct blkio_stats_handler *handler,
 			struct blkio_record_conf *conf);
 int blkio_trace_start(struct blkio_record_ctx *ctx);
 void blkio_trace_stop(struct blkio_record_ctx *ctx);
