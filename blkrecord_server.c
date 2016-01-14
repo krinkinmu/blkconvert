@@ -14,7 +14,10 @@
 #include "utils.h"
 
 
+static const char *debugfs = "/sys/kernel/debug";
+static const char *port;
 static volatile sig_atomic_t done;
+
 
 static void finish_tracing(int sig)
 {
@@ -48,9 +51,27 @@ static void blkio_net_status(int fd, int error, int drops)
 	mywrite(fd, &status, sizeof(status));
 }
 
-static void blkio_net_server(const struct blkio_record_conf *df, int fd)
+struct blkio_send_stats_handler {
+	struct blkio_stats_handler handler;
+	int fd;
+};
+
+static void blkio_send_stats(struct blkio_stats_handler *handler,
+			struct blkio_stats *stats)
 {
-	struct blkio_record_conf conf = *df;
+	struct blkio_net_stats stats_msg;
+	struct blkio_send_stats_handler *send =
+				(struct blkio_send_stats_handler *)handler;
+
+	stats_msg.hdr.type = htole32(BLKIO_MSG_STATS);
+	stats_msg.hdr.size = htole32(sizeof(stats_msg));
+	memcpy(&stats_msg.stats, stats, sizeof(*stats));
+	mywrite(send->fd, &stats_msg, sizeof(stats_msg));
+}
+
+static void blkio_net_server(int fd)
+{
+	struct blkio_record_conf conf;
 	char device_path[BLKIO_MAX_PATH];
 	union blkio_net_storage buffer;
 
@@ -70,6 +91,7 @@ static void blkio_net_server(const struct blkio_record_conf *df, int fd)
 		return;
 	}
 
+	conf.debugfs = debugfs;
 	conf.buffer_size = le32toh(start_msg->buffer_size);
 	conf.buffer_count = le32toh(start_msg->buffer_count);
 	conf.events_count = le32toh(start_msg->events_count);
@@ -77,9 +99,10 @@ static void blkio_net_server(const struct blkio_record_conf *df, int fd)
 	memcpy(device_path, start_msg->device, BLKIO_MAX_PATH);
 	conf.device = device_path;
 	
+	struct blkio_send_stats_handler handler = {{&blkio_send_stats}, fd};
 	struct blkio_record_ctx ctx;
 
-	if (blkio_record_ctx_setup(&ctx, &conf)) {
+	if (blkio_record_ctx_setup(&ctx, &handler.handler, &conf)) {
 		fprintf(stderr, "blkio_record_ctx_setup failed\n");
 		blkio_net_status(fd, BLKIO_STATUS_ERROR, 0);
 		close(fd);
@@ -95,14 +118,7 @@ static void blkio_net_server(const struct blkio_record_conf *df, int fd)
 	close(fd);
 }
 
-struct blkio_server_conf {
-	struct blkio_record_conf conf;
-	const char *port;
-};
-
-static const char *debugfs = "/sys/kernel/debug";
-
-static int parse_args(int argc, char **argv, struct blkio_server_conf *conf)
+static int parse_args(int argc, char **argv)
 {
 	static const char *opts = "f:t:";
 	static struct option long_opts[] = {
@@ -123,19 +139,15 @@ static int parse_args(int argc, char **argv, struct blkio_server_conf *conf)
 		}
 	};
 
-	/* fill in deafults */
-	memset(conf, 0, sizeof(*conf));
-	conf->conf.debugfs = debugfs;
-
 	int c;
 
 	while ((c = getopt_long_only(argc, argv, opts, long_opts, 0)) != -1) {
 		switch (c) {
 		case 'f':
-			conf->conf.debugfs = optarg;
+			debugfs = optarg;
 			break;
 		case 't':
-			conf->port = optarg;
+			port = optarg;
 			break;
 		default:
 			fprintf(stderr, "unrecognized option: %s\n", optarg);
@@ -143,7 +155,7 @@ static int parse_args(int argc, char **argv, struct blkio_server_conf *conf)
 		}
 	}
 
-	if (!conf->port) {
+	if (!port) {
 		fprintf(stderr, "you must specify port\n");
 		return -1;
 	}
@@ -161,14 +173,12 @@ static void show_usage(const char *name)
 
 int main(int argc, char **argv)
 {
-	struct blkio_server_conf conf;
-
-	if (parse_args(argc, argv, &conf)) {
+	if (parse_args(argc, argv)) {
 		show_usage(argv[0]);
 		return 1;
 	}
 
-	int fd = server_socket(conf.port, SOCK_STREAM);
+	int fd = server_socket(port, SOCK_STREAM);
 
 	if (fd < 0) {
 		perror("Cannot create server socket");
@@ -197,7 +207,7 @@ int main(int argc, char **argv)
 			break;
 		}
 
-		blkio_net_server(&conf.conf, client);
+		blkio_net_server(client);
 	}
 	close(fd);
 
