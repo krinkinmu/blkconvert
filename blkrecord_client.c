@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#include <zlib.h>
+
 #include <getopt.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -26,14 +28,6 @@ static size_t buffer_count = 4;
 static size_t events_count = 10000;
 static int poll_timeout = 1000;
 
-static void blkio_print_stats(struct blkio_stats *stats)
-{
-	printf("%llu-%llu: %lu reads, %lu writes\n",
-		(unsigned long long) stats->begin_time,
-		(unsigned long long) stats->end_time,
-		(unsigned long) stats->reads,
-		(unsigned long) stats->writes);
-}
 
 static int blkio_net_read(int fd, void *data)
 {
@@ -59,7 +53,25 @@ static void finish_tracing(int sig)
 	done = 1;
 }
 
-static void blkio_net_client(int sk, int fd)
+static int myzwrite(gzFile fd, const void *data, size_t size)
+{
+	const char *buf = data;
+	size_t wr = 0;
+
+	while (wr != size) {
+		const int rc = gzwrite(fd, buf + wr, size - wr);
+
+		if (rc <= 0) {
+			fprintf(stderr, "Write failed\n");
+			return -1;
+		}
+
+		wr += rc;
+	}
+	return 0;
+}
+
+static void blkio_net_client(int sk, gzFile fd)
 {
 	union blkio_net_storage buffer;
 	struct blkio_net_start *start_msg = &buffer.start;
@@ -82,9 +94,9 @@ static void blkio_net_client(int sk, int fd)
 		if (!blkio_net_read(sk, &buffer)) {
 			if (le32toh(buffer.hdr.type) != BLKIO_MSG_STATS)
 				break;
-			mywrite(fd, &buffer.stats.stats,
-						sizeof(buffer.stats.stats));
-			blkio_print_stats(&buffer.stats.stats);
+			if (myzwrite(fd, &buffer.stats.stats,
+					sizeof(buffer.stats.stats)))
+				done = 1;
 		} else {
 			done = 1;
 		}
@@ -99,8 +111,7 @@ static void blkio_net_client(int sk, int fd)
 	while (!blkio_net_read(sk, &buffer)) {
 		if (le32toh(buffer.hdr.type) != BLKIO_MSG_STATS)
 			break;
-		mywrite(fd, &buffer.stats.stats, sizeof(buffer.stats.stats));
-		blkio_print_stats(&buffer.stats.stats);
+		myzwrite(fd, &buffer.stats.stats, sizeof(buffer.stats.stats));
 	}
 
 	if (le32toh(buffer.hdr.type) == BLKIO_MSG_STATUS) {
@@ -276,6 +287,13 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	gzFile zfd = gzdopen(fd, "wb");
+	if (zfd == Z_NULL) {
+		perror("Failed to setup compression");
+		close(fd);
+		return 1;
+	}
+
 	int sk = client_socket(host, port, SOCK_STREAM);
 	if (fd < 0) {
 		perror("Cannot connect to server");
@@ -287,9 +305,9 @@ int main(int argc, char **argv)
 	handle_signal(SIGHUP, finish_tracing);
 	handle_signal(SIGTERM, finish_tracing);
 
-	blkio_net_client(sk, fd);
+	blkio_net_client(sk, zfd);
 
-	close(fd);
+	gzclose(zfd);
 	close(sk);
 
 	return 0;

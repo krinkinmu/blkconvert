@@ -3,7 +3,7 @@ CFLAGS  ?= -g -std=c99 -O3 -Wall -Wextra -Werror -D_GNU_SOURCE
 LDFLAGS ?= 
 
 BLKPLAY_LDFLAGS          := $(LDFLAGS) -laio -lz
-BLKRECORD_CLIENT_LDFLAGS := $(LDFLAGS)
+BLKRECORD_CLIENT_LDFLAGS := $(LDFLAGS) -lz
 BLKRECORD_SERVER_LDFLAGS := $(LDFLAGS) -pthread
 
 COMMON_SRC := algorithm.c object_cache.c file_io.c ctree.c list.c rbtree.c \
