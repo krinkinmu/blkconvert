@@ -7,7 +7,7 @@ BLKRECORD_CLIENT_LDFLAGS := $(LDFLAGS) -lz
 BLKRECORD_SERVER_LDFLAGS := $(LDFLAGS) -pthread
 
 COMMON_SRC := algorithm.c object_cache.c file_io.c ctree.c list.c rbtree.c \
-	debug.c utils.c network.c cbuffer.c deamon.c
+	debug.c utils.c network.c cbuffer.c daemon.c
 COMMON_DEP := $(COMMON_SRC:.c=.d)
 COMMON_OBJ := $(COMMON_SRC:.c=.o)
 

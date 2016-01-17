@@ -1,4 +1,4 @@
-#include "deamon.h"
+#include "daemon.h"
 #include "debug.h"
 
 #include <unistd.h>
@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <errno.h>
 
-int deamon(const char *name, deamon_fptr_t fptr)
+int mydaemon(const char *name, daemon_fptr_t fptr)
 {
 	const pid_t pid = fork();
 

@@ -24,7 +24,7 @@
 #include "account.h"
 #include "file_io.h"
 #include "network.h"
-#include "deamon.h"
+#include "daemon.h"
 #include "common.h"
 #include "debug.h"
 #include "utils.h"
@@ -973,8 +973,8 @@ int main(int argc, char **argv)
 
 	switch (play_mode) {
 	case BM_SERVER:
-		if (deamon("blkplayd", &blkplay_server))
-			ERR("Cannot run deamon process (%d)\n", errno);
+		if (mydaemon("blkplayd", &blkplay_server))
+			ERR("Cannot run daemon process (%d)\n", errno);
 		break;
 	case BM_CLIENT:
 		blkplay_client(&config);

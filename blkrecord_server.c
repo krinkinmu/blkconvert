@@ -13,7 +13,7 @@
 #include "trace.h"
 #include "network.h"
 #include "file_io.h"
-#include "deamon.h"
+#include "daemon.h"
 #include "utils.h"
 
 
@@ -253,7 +253,7 @@ int main(int argc, char **argv)
 	}
 
 	if (background)
-		deamon("blkrecordd", &blkio_listen);
+		mydaemon("blkrecordd", &blkio_listen);
 	else
 		blkio_listen();
 
