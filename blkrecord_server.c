@@ -1,5 +1,6 @@
 #include <sys/types.h>
-#include <byteswap.h>
+#include <sys/wait.h>
+#include <endian.h>
 #include <unistd.h>
 
 #include <getopt.h>
@@ -12,11 +13,14 @@
 #include "trace.h"
 #include "network.h"
 #include "file_io.h"
+#include "deamon.h"
 #include "utils.h"
 
 
 static const char *debugfs = "/sys/kernel/debug";
 static const char *port;
+static int background;
+static int sock;
 static volatile sig_atomic_t done;
 
 
@@ -24,6 +28,19 @@ static void finish_tracing(int sig)
 {
 	(void) sig;
 	done = 1;
+}
+
+static void reclaim_child(int sig)
+{
+	(void) sig;
+
+	while (1) {
+		int status;
+		pid_t pid = waitpid(-1, &status, WNOHANG);
+
+		if (!pid || (pid == -1 && errno != EINTR))
+			break;
+	}
 }
 
 static int blkio_net_read(int fd, void *data)
@@ -119,9 +136,42 @@ static void blkio_net_server(int fd)
 	close(fd);
 }
 
+static void blkio_listen(void)
+{
+	handle_signal(SIGINT, finish_tracing);
+	handle_signal(SIGHUP, finish_tracing);
+	handle_signal(SIGTERM, finish_tracing);
+	handle_signal(SIGCHLD, reclaim_child);
+
+	while (!done) {
+		struct sockaddr_storage addr;
+		socklen_t len = sizeof(addr);
+
+		int client = accept(sock, (struct sockaddr *)&addr, &len);
+
+		if (client < 0) {
+			if (errno != EINTR)
+				perror("Accept failed");
+			continue;
+		}
+
+		pid_t pid = fork();
+		if (pid < 0) {
+			perror("Fork failed");
+			continue;
+		}
+
+		if (pid == 0) {
+			blkio_net_server(client);
+			return;
+		}
+		close(client);
+	}
+}
+
 static int parse_args(int argc, char **argv)
 {
-	static const char *opts = "f:t:";
+	static const char *opts = "f:t:d";
 	static struct option long_opts[] = {
 		{
 			.name = "debugfs",
@@ -134,6 +184,12 @@ static int parse_args(int argc, char **argv)
 			.has_arg = required_argument,
 			.flag = NULL,
 			.val = 't'
+		},
+		{
+			.name = "daemon",
+			.has_arg = no_argument,
+			.flag = NULL,
+			.val = 'd'
 		},
 		{
 			.name = NULL
@@ -149,6 +205,9 @@ static int parse_args(int argc, char **argv)
 			break;
 		case 't':
 			port = optarg;
+			break;
+		case 'd':
+			background = 1;
 			break;
 		default:
 			fprintf(stderr, "unrecognized option: %s\n", optarg);
@@ -168,7 +227,8 @@ static void show_usage(const char *name)
 {
 	static const char *usage = "\n\n" \
 		"-f --debugfs - debugfs path [default=/sys/kernel/debug]\n" \
-		"-t --port - port to listen input connections [mandatory]\n";
+		"-t --port - port to listen input connections [mandatory]\n" \
+		"-d --daemon - run server in background\n";
 	fprintf(stderr, "%s %s", name, usage);
 }
 
@@ -179,38 +239,25 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	int fd = server_socket(port, SOCK_STREAM);
+	sock = server_socket(port, SOCK_STREAM);
 
-	if (fd < 0) {
+	if (sock < 0) {
 		perror("Cannot create server socket");
 		return 1;
 	}
 
-	if (listen(fd, 1)) {
+	if (listen(sock, 1)) {
 		perror("Listen failed");
-		close(fd);
+		close(sock);
 		return 1;
 	}
 
-	handle_signal(SIGINT, finish_tracing);
-	handle_signal(SIGHUP, finish_tracing);
-	handle_signal(SIGTERM, finish_tracing);
+	if (background)
+		deamon("blkrecordd", &blkio_listen);
+	else
+		blkio_listen();
 
-	while (!done) {
-		struct sockaddr_storage addr;
-		socklen_t len = sizeof(addr);
-
-		int client = accept(fd, (struct sockaddr *)&addr, &len);
-
-		if (client < 0) {
-			if (errno != EINTR)
-				perror("Accept failed");
-			break;
-		}
-
-		blkio_net_server(client);
-	}
-	close(fd);
+	close(sock);
 
 	return 0;
 }
