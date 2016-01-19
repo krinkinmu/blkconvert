@@ -131,8 +131,6 @@ static void blkio_event_insert(struct blkio_processor *proc,
 static void blkio_processor_populate_buffer(struct blkio_processor *proc,
 			struct blkio_buffer *buf)
 {
-	(void) proc;
-
 	for (size_t i = 0; i != buf->count; ++i) {
 		struct blkio_event_node *event =
 					blkio_alloc_event(buf->data + i);
@@ -162,7 +160,7 @@ static void blkio_processor_populate_buffers(struct blkio_processor *proc,
 	}
 }
 
-static void blkio_processor_populate(struct blkio_processor *proc)
+static int blkio_processor_populate(struct blkio_processor *proc)
 {
 	struct blkio_record_ctx *ctx = proc->ctx;
 	struct list_head *head = &ctx->tracers;
@@ -181,7 +179,10 @@ static void blkio_processor_populate(struct blkio_processor *proc)
 		list_splice_tail(&buffers, &tracer->bufs);
 		pthread_mutex_unlock(&tracer->lock);
 	}
+
+	const int rc = !list_empty(&buffers);
 	blkio_processor_populate_buffers(proc, &buffers);
+	return rc;
 }
 
 static int blkio_events_intersect(struct blkio_event_node *l,
@@ -384,9 +385,16 @@ static void *blkio_processor_main(void *data)
 	blkio_processor_wait(proc);
 
 	while (proc->state == TRACE_RUN) {
-		blkio_processor_populate(proc);
-		while (blkio_processor_handle(proc, 0));
-		pthread_yield();
+		if (blkio_processor_populate(proc)) {
+			while (blkio_processor_handle(proc, 0));
+			continue;
+		}
+
+		const long sec = conf->poll_timeout / 1000;
+		const long nsec = 1000000l * (conf->poll_timeout % 1000);
+		const struct timespec delay = { sec, nsec };
+
+		nanosleep(&delay, 0);
 	}
 
 	blkio_processor_populate(proc);
