@@ -28,7 +28,6 @@ struct blkio_stats {
 	__u32 iodepth;
 	__u32 batch;
 	__u32 pid;
-	__u32 cpu;
 	struct blkio_disk_layout reads_layout;
 	struct blkio_disk_layout writes_layout;
 };
@@ -55,7 +54,6 @@ struct blkio_event {
 	unsigned long long from;
 	unsigned long long to;
 	unsigned long pid;
-	unsigned long cpu;
 	unsigned char type;
 };
 
