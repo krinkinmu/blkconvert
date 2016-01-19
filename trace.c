@@ -83,6 +83,31 @@ static void blkio_free_buffer(struct blkio_buffer *buf)
 	free(buf);
 }
 
+static struct blkio_process_data *blkio_process_data_alloc(int pid,
+			size_t events)
+{
+	struct blkio_process_data *data = malloc(sizeof(*data));
+
+	if (!data)
+		return 0;
+
+	memset(data, 0, sizeof(*data));
+	data->pid = pid;
+	data->events = calloc(events, sizeof(struct blkio_event));
+
+	if (!data->events) {
+		free(data);
+		return 0;
+	}
+	return data;
+}
+
+static void blkio_process_data_free(struct blkio_process_data *data)
+{
+	free(data->events);
+	free(data);
+}
+
 static struct blkio_tracer *blkio_alloc_tracer(void)
 {
 	struct blkio_tracer *tracer = malloc(sizeof(struct blkio_tracer));
@@ -190,8 +215,14 @@ static void blkio_processor_populate_buffer(struct blkio_processor *proc,
 	}
 }
 
-static void blkio_insert_process_info(struct blkio_processor *proc,
-			struct blkio_process_info *info)
+struct blkio_pinfo_iter {
+	struct rb_node **plink;
+	struct rb_node *parent;
+	struct blkio_process_info *info;
+};
+
+static int blkio_lookup_process_info(struct blkio_processor *proc, int pid,
+			struct blkio_pinfo_iter *iter)
 {
 	struct rb_node **plink = &proc->procs.rb_node;
 	struct rb_node *parent = 0;
@@ -200,22 +231,37 @@ static void blkio_insert_process_info(struct blkio_processor *proc,
 		struct blkio_process_info *old = rb_entry(*plink,
 					struct blkio_process_info, node);
 
-		if (old->pid == info->pid) {
-			fprintf(stderr, "%d %s\n", info->pid, info->name);
-			rb_replace_node(&old->node, &info->node, &proc->procs);
-			blkio_process_info_free(old);
-			return;
+		if (old->pid == pid) {
+			iter->plink = plink;
+			iter->parent = parent;
+			iter->info = old;
+			return 1;
 		}
 
 		parent = *plink;
-		if (old->pid < info->pid)
+		if (old->pid < pid)
 			plink = &parent->rb_right;
 		else
 			plink = &parent->rb_left;
 	}
 
-	fprintf(stderr, "%d %s\n", info->pid, info->name);
-	rb_link_node(&info->node, parent, plink);
+	iter->plink = plink;
+	iter->parent = parent;
+	iter->info = 0;
+	return 0;
+}
+
+static void blkio_insert_process_info(struct blkio_processor *proc,
+			struct blkio_process_info *info)
+{
+	struct blkio_pinfo_iter iter;
+
+	if (blkio_lookup_process_info(proc, info->pid, &iter)) {
+		rb_replace_node(&iter.info->node, &info->node, &proc->procs);
+		blkio_process_info_free(iter.info);
+		return;
+	}
+	rb_link_node(&info->node, iter.parent, iter.plink);
 	rb_insert_color(&info->node, &proc->procs);
 }
 
@@ -284,25 +330,88 @@ static int blkio_events_intersect(struct blkio_event_node *l,
 	return 1;
 }
 
-static void blkio_processor_account_events(struct blkio_processor *proc)
+static void blkio_processor_account_process_events(struct blkio_processor *proc,
+			struct blkio_process_data *data)
 {
 	struct blkio_stats stats;
-		
+
 	memset(&stats, 0, sizeof(stats));
-	if (!account_events(proc->data, proc->count, &stats)) {
+
+	if (!account_events(data->events, data->count, &stats)) {
+		struct blkio_pinfo_iter iter;
 		struct blkio_record_ctx *ctx = proc->ctx;
 		struct blkio_stats_handler *handler = ctx->handler;
 
+		if (blkio_lookup_process_info(proc, data->pid, &iter))
+			strncpy(stats.name, iter.info->name, PROC_NAME_LEN);
+
+		stats.pid = data->pid;
 		handler->handle(handler, &stats);
 	}
+	blkio_process_data_free(data);
+}
+
+static void __blkio_processor_account_events(struct blkio_processor *proc,
+			struct rb_node *node)
+{
+	while (node) {
+		struct blkio_process_data *data = rb_entry(node,
+					struct blkio_process_data, node);
+
+		__blkio_processor_account_events(proc, node->rb_left);
+		node = node->rb_right;
+		blkio_processor_account_process_events(proc, data);
+	}
+}
+
+static void blkio_processor_account_events(struct blkio_processor *proc)
+{
+	__blkio_processor_account_events(proc, proc->data.rb_node);
+	proc->data.rb_node = 0;
+}
+
+static struct blkio_process_data *blkio_processor_get_process_data(
+			struct blkio_processor *proc, int pid)
+{
+	struct rb_node **plink = &proc->data.rb_node;
+	struct rb_node *parent = 0;
+
+	while (*plink) {
+		struct blkio_process_data *data = rb_entry(*plink,
+					struct blkio_process_data, node);
+
+		if (data->pid == pid)
+			return data;
+
+		parent = *plink;
+		if (data->pid < pid)
+			plink = &parent->rb_right;
+		else
+			plink = &parent->rb_left;
+	}
+
+	struct blkio_process_data *data =
+			blkio_process_data_alloc(pid, proc->size);
+
+	if (!data)
+		return 0;
+
+	rb_link_node(&data->node, parent, plink);
+	rb_insert_color(&data->node, &proc->data);
+	return data;
 }
 
 static void blkio_processor_append_event(struct blkio_processor *proc,
 			struct blkio_event_node *event)
 {
-	proc->data[proc->count++] = event->event;
+	struct blkio_process_data *data =
+		blkio_processor_get_process_data(proc, event->event.pid);
 
-	if (proc->count == proc->size) {
+	if (!data)
+		return;
+
+	data->events[data->count++] = event->event;
+	if (++proc->count == proc->size) {
 		blkio_processor_account_events(proc);
 		proc->count = 0;
 	}
@@ -466,12 +575,7 @@ static void *blkio_processor_main(void *data)
 	struct blkio_record_ctx *ctx = proc->ctx;
 	struct blkio_record_conf *conf = ctx->conf;
 
-	proc->data = calloc(conf->events_count, sizeof(struct blkio_event));
 	proc->size = conf->events_count;
-
-	if (!proc->data)
-		return 0;
-
 	blkio_processor_wait(proc);
 
 	while (proc->state == TRACE_RUN) {
@@ -495,7 +599,6 @@ static void *blkio_processor_main(void *data)
 	blkio_release_events(&proc->writes);
 	blkio_release_process_info(&proc->procs);
 
-	free(proc->data);
 	return 0;
 }
 
@@ -883,17 +986,12 @@ static void blkio_destroy_processor(struct blkio_record_ctx *ctx)
 
 static int blkio_create_processor(struct blkio_record_ctx *ctx)
 {
+	memset(&ctx->processor, 0, sizeof(ctx->processor));
 	assert(!pthread_mutex_init(&ctx->processor.lock, NULL));
 	assert(!pthread_cond_init(&ctx->processor.cond, NULL));
-	memset(&ctx->processor.events, 0, sizeof(ctx->processor.events));
-	memset(&ctx->processor.writes, 0, sizeof(ctx->processor.writes));
-	memset(&ctx->processor.reads, 0, sizeof(ctx->processor.reads));
-	memset(&ctx->processor.procs, 0, sizeof(ctx->processor.procs));
 	ctx->processor.state = TRACE_WAIT;
 	ctx->processor.ctx = ctx;
-	ctx->processor.data = 0;
-	ctx->processor.count = 0;
-	ctx->processor.size = 0;
+	ctx->processor.size = ctx->conf->events_count;
 	return blkio_start_processor(&ctx->processor);
 }
 

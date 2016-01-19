@@ -48,13 +48,20 @@ struct blkio_tracer {
 
 struct blkio_record_ctx;
 
+struct blkio_process_data {
+	struct rb_node node;
+	int pid;
+	struct blkio_event *events;
+	size_t count;
+};
+
 struct blkio_processor {
 	struct blkio_record_ctx *ctx;
 	struct rb_root events;
 	struct rb_root reads;
 	struct rb_root writes;
 	struct rb_root procs;
-	struct blkio_event *data;
+	struct rb_root data;
 	size_t count, size;
 	pthread_t thread;	
 	pthread_mutex_t lock;

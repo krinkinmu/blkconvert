@@ -6,6 +6,7 @@
 
 #define IO_SIZE_BITS   16
 #define IO_OFFSET_BITS 64
+#define PROC_NAME_LEN  31
 
 
 struct blkio_disk_layout {
@@ -20,6 +21,7 @@ struct blkio_disk_layout {
 };
 
 struct blkio_stats {
+	char name[PROC_NAME_LEN + 1];
 	__u64 begin_time;
 	__u64 end_time;
 	__u64 inversions;

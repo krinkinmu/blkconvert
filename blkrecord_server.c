@@ -155,16 +155,16 @@ static void blkio_listen(void)
 			continue;
 		}
 
-		pid_t pid = fork();
-		if (pid < 0) {
-			perror("Fork failed");
-			continue;
-		}
+//		pid_t pid = fork();
+//		if (pid < 0) {
+//			perror("Fork failed");
+//			continue;
+//		}
 
-		if (pid == 0) {
+//		if (pid == 0) {
 			blkio_net_server(client);
-			return;
-		}
+//			return;
+//		}
 		close(client);
 	}
 }
