@@ -34,6 +34,24 @@ static struct blkio_event_node *blkio_alloc_event(struct blkio_event *event)
 static void blkio_free_event(struct blkio_event_node *event)
 { free(event); }
 
+static struct blkio_process_info *blkio_process_info_alloc(size_t size)
+{
+	void *ptr = malloc(sizeof(struct blkio_process_info) + size);
+
+	if (!ptr)
+		return 0;
+
+	struct blkio_process_info *pinfo = ptr;
+
+	memset(pinfo, 0, sizeof(*pinfo));
+	list_head_init(&pinfo->link);
+	pinfo->name = (void *)(pinfo + 1);
+	return pinfo;
+}
+
+static void blkio_process_info_free(struct blkio_process_info *info)
+{ free(info); }
+
 static struct blkio_buffer *blkio_alloc_buffer(size_t size)
 {
 	void *ptr = malloc(sizeof(struct blkio_buffer) + size);
@@ -44,13 +62,26 @@ static struct blkio_buffer *blkio_alloc_buffer(size_t size)
 	struct blkio_buffer *buffer = ptr;
 
 	memset(buffer, 0, sizeof(*buffer));
-	list_head_init(&buffer->head);
+	list_head_init(&buffer->link);
+	list_head_init(&buffer->proc);
 	buffer->data = (void *)(buffer + 1);
 	return buffer;
 }
 
 static void blkio_free_buffer(struct blkio_buffer *buf)
-{ free(buf); }
+{
+	struct list_head *head = &buf->proc;
+	struct list_head *ptr = head->next;
+
+	while (ptr != head) {
+		struct blkio_process_info *info = list_entry(ptr,
+					struct blkio_process_info, link);
+		ptr = ptr->next;
+		blkio_process_info_free(info);
+	}
+
+	free(buf);
+}
 
 static struct blkio_tracer *blkio_alloc_tracer(void)
 {
@@ -83,6 +114,21 @@ static void __blkio_release_events(struct rb_node *node)
 
 static void blkio_release_events(struct rb_root *events)
 { __blkio_release_events(events->rb_node); }
+
+static void __blkio_release_process_info(struct rb_node *node)
+{
+	while (node) {
+		struct blkio_process_info *info = rb_entry(node,
+					struct blkio_process_info, node);
+
+		__blkio_release_process_info(node->rb_right);
+		node = node->rb_left;
+		blkio_process_info_free(info);
+	}
+}
+
+static void blkio_release_process_info(struct rb_root *procs)
+{ __blkio_release_process_info(procs->rb_node); }
 
 static void blkio_free_tracer(struct blkio_tracer *tracer)
 {
@@ -144,6 +190,50 @@ static void blkio_processor_populate_buffer(struct blkio_processor *proc,
 	}
 }
 
+static void blkio_insert_process_info(struct blkio_processor *proc,
+			struct blkio_process_info *info)
+{
+	struct rb_node **plink = &proc->procs.rb_node;
+	struct rb_node *parent = 0;
+
+	while (*plink) {
+		struct blkio_process_info *old = rb_entry(*plink,
+					struct blkio_process_info, node);
+
+		if (old->pid == info->pid) {
+			fprintf(stderr, "%d %s\n", info->pid, info->name);
+			rb_replace_node(&old->node, &info->node, &proc->procs);
+			blkio_process_info_free(old);
+			return;
+		}
+
+		parent = *plink;
+		if (old->pid < info->pid)
+			plink = &parent->rb_right;
+		else
+			plink = &parent->rb_left;
+	}
+
+	fprintf(stderr, "%d %s\n", info->pid, info->name);
+	rb_link_node(&info->node, parent, plink);
+	rb_insert_color(&info->node, &proc->procs);
+}
+
+static void blkio_update_process_info(struct blkio_processor *proc,
+			struct list_head *head)
+{
+	struct list_head *ptr = head->next;
+
+	while (ptr != head) {
+		struct blkio_process_info *info = list_entry(ptr,
+					struct blkio_process_info, link);
+
+		ptr = ptr->next;
+		blkio_insert_process_info(proc, info);
+	}
+	list_head_init(head);
+}
+
 static void blkio_processor_populate_buffers(struct blkio_processor *proc,
 			struct list_head *head)
 {
@@ -151,11 +241,12 @@ static void blkio_processor_populate_buffers(struct blkio_processor *proc,
 
 	while (ptr != head) {
 		struct blkio_buffer *buf = list_entry(ptr, struct blkio_buffer,
-					head);
+					link);
 
 		ptr = ptr->next;
-		list_unlink(&buf->head);
+		list_unlink(&buf->link);
 		blkio_processor_populate_buffer(proc, buf);
+		blkio_update_process_info(proc, &buf->proc);
 		blkio_free_buffer(buf);
 	}
 }
@@ -273,7 +364,6 @@ static void blkio_processor_handle_complete(struct blkio_processor *proc,
 		struct rb_node *next = rb_next(&first->node);
 		struct blkio_event_node tmp = *event;
 
-		tmp.event.cpu = first->event.cpu;
 		tmp.event.pid = first->event.pid;
 
 		if (first->event.from >= event->event.from) {
@@ -403,6 +493,7 @@ static void *blkio_processor_main(void *data)
 	blkio_release_events(&proc->events);
 	blkio_release_events(&proc->reads);
 	blkio_release_events(&proc->writes);
+	blkio_release_process_info(&proc->procs);
 
 	free(proc->data);
 	return 0;
@@ -423,7 +514,6 @@ static int blkio_trace_to_cpu(struct blk_io_trace *trace)
 	trace->action = __bswap_32(trace->action);
 	trace->pdu_len = __bswap_16(trace->pdu_len);
 	trace->pid = __bswap_32(trace->pid);
-	trace->cpu = __bswap_32(trace->cpu);
 	return 0;
 }
 
@@ -475,23 +565,64 @@ static void blkio_submit_traces(struct blkio_tracer *tracer,
 	if (!traces)
 		return;
 
-	if (!traces->count) {
+	if (!traces->count && list_empty(&traces->proc)) {
 		blkio_free_buffer(traces);
 		return;
 	}
 
 	traces->timestamp = traces->data[0].time;
 	pthread_mutex_lock(&tracer->lock);
-	list_link_before(&tracer->bufs, &traces->head);
+	list_link_before(&tracer->bufs, &traces->link);
 	pthread_mutex_unlock(&tracer->lock);
 }
 
 static int blkio_accept_trace(struct blk_io_trace *trace)
 {
+	if (trace->action == BLK_TN_PROCESS)
+		return 1;
+
 	if (!trace->bytes)
 		return 0;
 
 	return blkio_queue_event(trace) || blkio_complete_event(trace);
+}
+
+static void blkio_append_trace(struct blkio_buffer *traces,
+			struct blk_io_trace *trace, char *pdu)
+{
+	if (trace->action == BLK_TN_PROCESS) {
+		char kernel[] = "kernel";
+
+		if (trace->pid == 0)
+			pdu = kernel;
+
+		char *slash = strchr(pdu, '/');
+
+		if (slash)
+			*slash = '\0';
+
+		const int len = strlen(pdu) + 1;
+		struct blkio_process_info *info = blkio_process_info_alloc(len);
+
+		if (!info)
+			return;
+
+		info->name = (char *)(info + 1);
+		info->pid = trace->pid;
+		strcpy(info->name, pdu);
+		list_link_before(&traces->proc, &info->link);
+
+		return;
+	}
+
+	struct blkio_event *event = traces->data + traces->count;
+
+	event->time = trace->time;
+	event->from = trace->sector;
+	event->to = trace->sector + MAX(1, trace->bytes / 512);
+	event->type = blkio_trace_type(trace);
+	event->pid = trace->pid;
+	++traces->count;
 }
 
 static int blkio_read_traces(struct blkio_tracer *tracer,
@@ -524,6 +655,7 @@ static int blkio_read_traces(struct blkio_tracer *tracer,
 				return -1;
 
 			const size_t skip = trace_size + trace.pdu_len;
+			void *pdu = buffer + pos + trace_size;
 
 			if (skip > *size - pos)
 				break;
@@ -533,16 +665,7 @@ static int blkio_read_traces(struct blkio_tracer *tracer,
 			if (!blkio_accept_trace(&trace))
 				continue;
 
-			struct blkio_event *event =
-						traces->data + traces->count;
-
-			event->time = trace.time;
-			event->from = trace.sector;
-			event->to = trace.sector + MAX(1, trace.bytes / 512);
-			event->type = blkio_trace_type(&trace);
-			event->cpu = 0;
-			event->pid = 0;
-
+			blkio_append_trace(traces, &trace, pdu);
 			if (++traces->count == max_count) {
 				blkio_submit_traces(tracer, traces);
 				traces = 0;
@@ -765,6 +888,7 @@ static int blkio_create_processor(struct blkio_record_ctx *ctx)
 	memset(&ctx->processor.events, 0, sizeof(ctx->processor.events));
 	memset(&ctx->processor.writes, 0, sizeof(ctx->processor.writes));
 	memset(&ctx->processor.reads, 0, sizeof(ctx->processor.reads));
+	memset(&ctx->processor.procs, 0, sizeof(ctx->processor.procs));
 	ctx->processor.state = TRACE_WAIT;
 	ctx->processor.ctx = ctx;
 	ctx->processor.data = 0;

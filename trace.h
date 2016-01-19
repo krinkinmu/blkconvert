@@ -8,8 +8,16 @@
 #include "rbtree.h"
 #include "list.h"
 
+struct blkio_process_info {
+	struct rb_node node;
+	struct list_head link;
+	int pid;
+	char *name;
+};
+
 struct blkio_buffer {
-	struct list_head head;
+	struct list_head link;
+	struct list_head proc;
 	unsigned long long timestamp;
 	struct blkio_event *data;
 	size_t count;
@@ -45,6 +53,7 @@ struct blkio_processor {
 	struct rb_root events;
 	struct rb_root reads;
 	struct rb_root writes;
+	struct rb_root procs;
 	struct blkio_event *data;
 	size_t count, size;
 	pthread_t thread;	
